@@ -1095,3 +1095,9 @@ don't match your hardware, no effect either way.
 - Trusting the certificate is the part with real blast radius, not the patching. Prune what you no
   longer need — see [Cleaning up trusted certificates](#cleaning-up-trusted-certificates) — and
   turn Test Signing mode back off when you're done.
+
+## Contributors
+
+- **qron88** — author.
+- **Qwen (self-hosted LLM)** — analysis and engineering support on [1.0.4](CHANGELOG.md#104---2026-10-12):
+  dependency-bar analysis, the 7z-free unpack route, tool preflight, and the verified-release matrix.
