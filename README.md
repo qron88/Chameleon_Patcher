@@ -11,8 +11,12 @@ desktop driver's INF whitelist does not cover, so the driver will not install or
 as-is. (Blackwell coverage is essentially nil: one `DEV_2D00` entry, under a null subsystem ID
 that real hardware is unlikely to report.) This is the standard "make the desktop driver see my
 transplanted mobile GPU" enthusiast unlock, done reproducibly: point the tool at a downloaded
-driver `.exe` and it unpacks, patches, verifies and re-signs it, leaving a plain folder behind,
-on any driver version.
+driver `.exe` and it unpacks, patches, verifies and re-signs it, leaving a plain folder behind.
+
+The patching is built to survive NVIDIA renumbering and renaming INFs between releases, so it is
+written for **any** driver version — but only the releases in
+[Verified driver releases](#verified-driver-releases) have actually been run end to end. Read that
+table before pointing this at a brand-new driver.
 
 Two independent gates have to come off for an unlocked GPU to work, and the patcher handles both:
 
@@ -90,15 +94,15 @@ script that regenerates the `.ico` and `.png` from it.
 | `Source\Chameleon-Patcher.cs` | The GUI's source. Version attributes sit at the top of the file and are the single place the release number is declared - see [Version](#version). |
 | `Source\Build.ps1` | Rebuilds the `.exe` into the project root with `csc.exe` and prints the version resource it produced. |
 | `Scripts\Invoke-DriverPatchPipeline.ps1` | All-in-one: unpack → patch → sign → add the installer checkbox, and prune old signing keys from `Cert:\CurrentUser\My` (see `-KeepAllOldCerts`). Takes either a raw downloaded `.exe` or an already-unpacked folder; result is always a plain folder. |
-| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. |
-| `Scripts\Add-ExtraGpuSupport.ps1` | Applies `whitelist.json` to **any** stock `Display.Driver` folder — current or future NVIDIA driver versions. Does not hardcode section numbers, so it survives INF renumbering between releases, and resolves INF *filenames* by stem so it survives them being renamed too — see [When NVIDIA renames the INFs](#when-nvidia-renames-the-infs). |
+| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). |
+| `Scripts\Add-ExtraGpuSupport.ps1` | Applies `whitelist.json` to a stock `Display.Driver` folder. Does not hardcode section numbers, so it survives INF renumbering between releases, and resolves INF *filenames* by stem so it survives them being renamed too — see [When NVIDIA renames the INFs](#when-nvidia-renames-the-infs). Written for any driver version; only the releases in [Verified driver releases](#verified-driver-releases) have been run end to end. |
 | `Scripts\Add-RmCapabilityOverride.ps1` | Adds the `RM1457588` registry override to every `nv_miscBase_addreg__*` section in every driver INF - fixes VRAM size misreporting and broken compute on whitelisted GPUs. See [below](#why-vram-size--compute-needs-a-second-fix). |
 | `Scripts\Remove-ForeignOemInfs.ps1` | Drops the OEM display INFs that cannot match this machine, taking the catalog rebuild from ~50 min to ~7. Opt-in via `-PruneForeignOemInfs`. See [Making a run finish in minutes](#making-a-run-finish-in-minutes-instead-of-an-hour). |
 | `Scripts\Enable-OptionalComponents.ps1` | Makes PhysX and the NVIDIA App offered for the unlocked GPUs, and the NVIDIA App unticked-able. See [PhysX and the NVIDIA App](#physx-and-the-nvidia-app). |
 | `Scripts\Test-DriverPatch.ps1` | Verifies a package really was patched, and is run **before signing** so a silently-unpatched package can't be signed and shipped as finished. See [The verification gate](#the-verification-gate). Also runnable standalone against any package. |
 | `Scripts\New-DriverSigningCert.ps1` | Generates a fresh, locally-owned self-signed code-signing cert (does **not** touch system trust stores). The key is **non-exportable** and stays in `Cert:\CurrentUser\My`, so there is no `.pfx` and no password at all. `-Exportable` opts into a portable `.pfx`. Defaults to a 3-year life. |
 | `Scripts\Sign-DriverPackage.ps1` | Rebuilds `nv_disp.cat` from the patched INFs (`Inf2Cat.exe`) and signs it (`signtool.exe`) with your cert. Signs **without any password** when the key is in your certificate store — see [Signing without a password](#signing-without-a-password). |
-| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, `Inf2Cat.exe`, `signtool.exe`), dot-sourced by the others. The pipeline uses it to check every tool up front, so a missing SDK fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. |
+| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, NVIDIA's `setup.exe`, `Inf2Cat.exe`, `signtool.exe`) and the install guidance shown when one is missing, dot-sourced by the others. The pipeline uses it to check every tool up front, so a missing SDK fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. |
 | `Scripts\Add-SetupCertOption.ps1` | Adds a "Chameleon GPU cert." component to `setup.exe`'s Custom Installation Options screen, **ticked by default** and still user-selectable; `-Unchecked` makes it opt-in. Left ticked, it trusts the certificate in `Root` and `TrustedPublisher`, like `Approve-DriverPatchCert.ps1`. The label lives in `templates\GpuUnlockCert.nvi.template`, the same string in every locale. |
 | `Scripts\Approve-DriverPatchCert.ps1` | Standalone alternative to the installer checkbox: trusts the cert via a separate, explicit script you run yourself. Adds `Root` (makes the chain work) and `TrustedPublisher` (installs without a device-software prompt). By default it trusts the certificate the pipeline signs with. |
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
@@ -106,9 +110,11 @@ script that regenerates the `.ico` and `.png` from it.
 | `Scripts\templates\GpuUnlockCert.nvi.template` | The verified-working installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
-Unpacking a downloaded `.exe` needs a 7z-compatible CLI - this machine has NanaZip (a 7-Zip-
+Unpacking a downloaded `.exe` prefers a 7z-compatible CLI - this machine has NanaZip (a 7-Zip-
 compatible Store app), auto-detected via the `7z.exe` WindowsApps alias. A plain 7-Zip install
-under Program Files works too.
+under Program Files works too. With neither installed, `Unpack-DriverExe.ps1` expands the package
+through NVIDIA's own installer instead, so 7-Zip is a speed option, not a requirement. The one
+dependency you must install is the Windows SDK - see [Dependencies](#dependencies).
 
 ## GUI
 
@@ -139,6 +145,20 @@ Ticking "Build for this PC only" on a machine whose GPU this patcher doesn't unl
 before the run starts, offering the portable build instead - see [A pruned build needs a GPU worth
 pruning for](#a-pruned-build-needs-a-gpu-worth-pruning-for). Answering yes unticks the box, so the
 log header and the output folder name both reflect what was actually built.
+
+Before a run starts, the GUI asks the pipeline which external tools this machine can resolve
+(`-CheckPatchTools`) and refuses to begin if `Inf2Cat` or `signtool` is missing - the two
+dependencies with no substitute. The dialog names each missing tool and carries its install
+command, and says plainly that nothing has been unpacked and nothing was changed. That check exists
+because the catalog rebuild is the step that takes tens of minutes: finding out the SDK is absent
+after a multi-GB unpack is the expensive order. A missing 7-Zip is **not** a refusal - the status
+line notes that unpacking will go through NVIDIA's installer and be slower, and the run proceeds.
+See [Dependencies](#dependencies).
+
+An unexpected error is recorded, not swallowed. `AppDomain.UnhandledException` and
+`Application.ThreadException` are both hooked, so an exception escaping an `async void` handler
+writes a `[crash]` line into the run log and shows one readable dialog, instead of taking the app
+down as a raw Win32 crash and leaving the log silent mid-patch.
 
 There are **no certificate fields by default** - signing uses the key already in your certificate
 store, with no password, and a PC with no key gets a new certificate minted automatically. The
@@ -254,34 +274,81 @@ lives in the GUI wrapper. Redirect the script's output instead:
 
 ## Dependencies
 
-Everything below is either bundled with Windows already or auto-detected by the scripts - nothing
-here requires internet access to install.
+Designed for the lowest possible bar: everything below is either already in Windows 11, or is
+auto-detected by the scripts. Nothing here needs internet access to install, and nothing needs
+PowerShell 7, .NET 8, an SDK for the GUI, or a package manager.
 
 Signing does reach the network once, for an RFC3161 timestamp, but that is best-effort: if the
 timestamp server is unreachable the catalog is still signed and the run continues with a warning.
 `-SkipTimestamp` skips the attempt entirely, making the whole pipeline fully offline-capable.
 
-**Runtime environment**
+**Already in Windows 11 — nothing to install**
 - **Windows PowerShell 5.1** (`powershell.exe`) - every `.ps1` script targets this specifically,
   not PowerShell 7+. The scripts work around two of its quirks: `$PSScriptRoot` is empty inside a
   `param()` default value when a script is launched via `-File`, and `Read-Host -AsSecureString`
-  doesn't work over a redirected stdin pipe.
+  doesn't work over a redirected stdin pipe. PS 7 is deliberately **not** a dependency: it is an
+  optional install, and requiring it would raise the bar for no benefit — the code uses no PS 7-only
+  syntax.
 - **.NET Framework 4.x** - `Chameleon-Patcher.exe` is a compiled WinForms app; needs the .NET
   Framework runtime (present on any normal Windows 10/11 install) to run at all.
+- **`certutil.exe`** - used by `Approve-DriverPatchCert.ps1` and by the `GpuUnlockCert.nvi`
+  installer component. Built into Windows.
+- **The PKI module** (`New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate`)
+  - used by `New-DriverSigningCert.ps1`. Ships with Windows.
+- **`Get-CimInstance`** - `PatchToolDiscovery.ps1` reads this machine's GPUs through
+  `Win32_PnPEntity` for the pruning gate. Built into Windows.
+
+**The one thing you install: the Windows SDK**
+
+`Inf2Cat.exe` and `signtool.exe` are the only dependencies that are not in Windows, and they are
+the only ones with no substitute: editing the INFs invalidates `nv_disp.cat`, and `Inf2Cat` is the
+only tool that rebuilds it.
+
+A **full Windows Driver Kit is not needed** — the Windows SDK alone is enough. On the machine
+these runs were measured on, `Inf2Cat.exe` comes from the SDK's **Windows Driver Kit** feature and
+`signtool.exe` from **Windows SDK Signing Tools**; both are features of the Windows SDK, not of a
+separate WDK install. Install the SDK from Microsoft's download page and keep those two features
+selected:
+
+<https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/>
+
+`PatchToolDiscovery.ps1` finds both: it searches `%WDKContentRoot%` and `Windows Kits\10\bin`,
+picking the newest SDK version and, within it, the x64 build (`Inf2Cat.exe` ships x86-only;
+`signtool.exe` ships x86/x64/arm64), then falls back to `PATH`. Override with `-Inf2CatPath` /
+`-SignToolPath`. The pipeline resolves both **before** copying anything, so a missing SDK fails in
+seconds — not after a multi-GB unpack. The GUI asks the same question before it starts and shows
+the install guidance above.
+
+**7-Zip is optional**
+
+Unpacking a driver `.exe` has two routes, and `Unpack-DriverExe.ps1` picks between them:
+
+1. **A 7z-compatible CLI (NanaZip, 7-Zip)** — the preferred route. Extracts straight into the
+   folder you name, in one step, running nothing. Found via the WindowsApps `7z.exe` alias, then
+   `Program Files\7-Zip`, then `Program Files\NanaZip`, then `PATH`.
+2. **NVIDIA's own installer, `setup.exe -x -s`** — the no-install fallback. Expands the package
+   without installing a driver, so a machine with nothing third-party installed can still patch a
+   download. It is slower, and it expands to NVIDIA's fixed location under the volume root
+   (`C:\NVIDIA\DisplayDriver\<version>\<os>\Current`) rather than to a path you choose, so the
+   result is copied into the output folder afterwards. It runs the downloaded installer, so it
+   needs the download to be on — and runnable on — this machine.
+
+Point `-SourcePackagePath` at an already-unpacked folder and neither route runs at all.
 
 **External tools each script shells out to**
 
 | Tool | Used by | How it's found |
 |---|---|---|
-| A 7z-compatible CLI (NanaZip or 7-Zip) | `Unpack-DriverExe.ps1` | Checks the WindowsApps `7z.exe` alias, then `Program Files\7-Zip`, then `PATH`; throws if none found |
-| `Inf2Cat.exe` + `signtool.exe` (Windows SDK/WDK) | `Sign-DriverPackage.ps1` | `PatchToolDiscovery.ps1` searches `%WDKContentRoot%` and `Windows Kits\10\bin`, picking the newest SDK version and its x64 build, then falls back to `PATH`. Override with `-Inf2CatPath` / `-SignToolPath`. The pipeline resolves both **before** copying anything, so a missing SDK fails immediately. |
+| `Inf2Cat.exe` + `signtool.exe` (Windows SDK) | `Sign-DriverPackage.ps1` | `%WDKContentRoot%`, then `Windows Kits\10\bin` (newest version, x64 preferred), then `PATH`. **Required — no fallback.** |
+| A 7z-compatible CLI (NanaZip or 7-Zip) | `Unpack-DriverExe.ps1` | WindowsApps alias, `Program Files\7-Zip`, `Program Files\NanaZip`, then `PATH`. **Optional** — falls back to NVIDIA's installer. |
+| NVIDIA's `setup.exe` | `Unpack-DriverExe.ps1` (fallback route) | `C:\NVIDIA\DisplayDriver`, then the `NVIDIA Display Operation Server` temp folder. |
 | `certutil.exe` (built into Windows) | `Approve-DriverPatchCert.ps1`, and the `GpuUnlockCert.nvi` installer component | Always present on Windows |
 | `New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate` (PKI module, built-in) | `New-DriverSigningCert.ps1` | Ships with Windows, no install needed |
 
 **Build-time only** (not needed to *run* the toolkit, only to *rebuild* the GUI after editing
 `Source\Chameleon-Patcher.cs`): `csc.exe` at
 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`, invoked by `Source\Build.ps1` (see
-[GUI](#gui) above).
+[GUI](#gui) above). That is in Windows already, so rebuilding needs no install either.
 
 **Internal dependencies within the project**
 - `Invoke-DriverPatchPipeline.ps1` is the orchestrator - it calls all the other scripts in
@@ -323,18 +390,38 @@ applied**, reuses (or first generates) a signing cert, rebuilds and signs `nv_di
 the opt-in installer checkbox. Output goes to a plain folder, `<basename>_Patched` next to the
 source.
 
-Re-run exactly that same command for each future NVIDIA driver release. You do **not** need to
+Re-run exactly that same command for each NVIDIA driver release. You do **not** need to
 pass a certificate or a password: the pipeline finds your existing signing key in
 `Cert:\CurrentUser\My` on its own and signs with it, so every release keeps using the same
-already-trusted certificate instead of minting a new one you'd have to re-trust. Before it copies
+already-trusted certificate instead of minting a new one you'd have to re-trust. A release listed
+in [Verified driver releases](#verified-driver-releases) is a known-good run; on an unlisted one,
+watch the `Patch verification PASSED` line before you trust the output. Before it copies
 anything it prints which tools and which certificate it resolved:
 
 ```
 Preflight: checking tools and signing identity...
-  Inf2Cat:  C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\Inf2Cat.exe
-  signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe
+  7z:       C:\Users\Kuba\AppData\Local\Microsoft\WindowsApps\7z.exe
+  Inf2Cat:  C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x86\Inf2Cat.exe
+  signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\signtool.exe
   cert:     2A4A4A0C6666E4CD1E59E04CBF4EAFCB06843EA8 (from certificate store - no password needed)
 ```
+
+With no 7-Zip installed, the `7z:` line says so and names the fallback route instead of a path:
+
+```
+  7z:       none found - unpacking via NVIDIA's installer (setup.exe -x -s) instead
+            slower, and needs the download on this machine; install 7-Zip for the
+            fast route:  winget install -e --id 7zip.7zip
+```
+
+Ask the same question on its own, without patching anything:
+
+```powershell
+.\Scripts\Invoke-DriverPatchPipeline.ps1 -CheckPatchTools
+```
+
+Prints `TOOLS_OK` or `TOOLS_MISSING` with each resolved path, and the install guidance for anything
+that is missing. The GUI runs this before it starts a patch.
 
 If you already have an unpacked folder instead of the `.exe`, use `-SourcePackagePath` instead -
 same pipeline minus the unpack step:
@@ -424,6 +511,42 @@ The two patchers also fail loudly rather than shrugging. `Add-ExtraGpuSupport.ps
 an INF has no `[NVIDIA_Devices*]` block at all, and `Add-RmCapabilityOverride.ps1` throws if no
 INF in the package has an `[nv_miscBase_addreg__NN]` section. Both of those mean "this driver
 release's layout is not what this script understands", which is worth stopping for.
+
+## Verified driver releases
+
+The patching logic is written to survive NVIDIA renumbering and renaming INFs, so it is *built*
+for any driver version. That is not the same as being *verified* on one, and the two are kept
+apart deliberately. The table below is every release this toolkit has been run against end to end,
+taken from the run logs — not from a claim.
+
+| Driver release | Toolkit version | Build | Whitelist gate | Outcome |
+|---|---|---|---|---|
+| 595.79 | — | reference | — | Source of `whitelist.json`: a stock package diffed against a hand-patched one. Not a toolkit run. |
+| 616.86 desktop-notebook | 1.0.1+ | pruned | 58/58 | Ran against a real package. The release that exposed the `nv_dispig.inf` rename (tier 2) and the prune-to-nothing bug; the pruning timings below are measured on it. |
+| 616.92 Studio (`nsd-dch`) | 1.0.1+ | pruned | 58/58 | Ran against a real package. The release that exposed the `nv_dispsi.inf` rename (tier 3), including the run that deleted all 45 display INFs. |
+| 617.14 | 1.0.3 | universal | 61/61 in place, references resolve, RM override applied | Success, 31 min 43 s — full 43-INF catalog rebuild, timestamped signature. |
+| 617.42 | 1.0.3 | pruned to 1 INF | 58/58 in place, references resolve, RM override applied | Success, 1 min 20 s. Built for an RTX A2000m (`DEV_25B8&SUBSYS_000010DE`). |
+
+The 617.14 and 617.42 rows are read straight out of `Logs\` and carry the gate's own verdict. The
+616.86 and 616.92 rows are reconstructed from the changelog and the measured timings — those runs
+predate the current log format, so their gate numbers are the reported ones, not a log line.
+
+What "verified" means here, concretely: the pipeline ran to completion, `Test-DriverPatch.ps1`
+passed its gate, and `signtool` signed the rebuilt catalog. **It does not mean the patched driver
+was installed and driven on real hardware** — see [PhysX and the NVIDIA App](#physx-and-the-nvidia-app)
+and [Trusting the certificate](#trusting-the-certificate), where the project says so plainly.
+
+**On an unlisted release, the gate is the thing to watch.** A run that unpacks, patches, signs and
+installs cleanly can still carry no unlock at all — that is exactly the failure NVIDIA's INF renames
+produced before the stem-based lookup existed. `Patch verification PASSED - N/N whitelist entries in
+place` is the line that says the unlock is in the package. If the whitelist step reports skipping an
+INF, or the gate reports fewer than 61 entries on a universal build, stop and read
+[When NVIDIA renames the INFs](#when-nvidia-renames-the-infs) before installing.
+
+**Blackwell (RTX 50-series) is out of scope.** `whitelist.json` carries one Blackwell entry,
+`DEV_2D00` under a null subsystem ID that real hardware is unlikely to report. A 617.42 run on a
+machine carrying a GeForce RTX 5070 Ti reports it as `not in whitelist.json` — by design, not as a
+failure. Unlocking Blackwell mobile parts needs entries this project does not have.
 
 ## Making a run finish in minutes instead of an hour
 

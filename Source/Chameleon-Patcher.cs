@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -20,8 +21,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.3.0")]
-[assembly: AssemblyInformationalVersion("1.0.3")]
+[assembly: AssemblyFileVersion("1.0.4.0")]
+[assembly: AssemblyInformationalVersion("1.0.4")]
 
 namespace ChameleonPatcherGui
 {
@@ -32,6 +33,19 @@ namespace ChameleonPatcherGui
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            // Last-resort handlers. Without these, an exception that escapes an `async void`
+            // handler (BtnStart_Click is one) is rethrown on the Windows message loop and takes
+            // the whole app down as a raw Win32 crash - no message, and the run's log stops
+            // without recording why. The log is the primary diagnostic artifact for this tool, so
+            // a crash that leaves it silent is the worst failure mode available. Both handlers
+            // write to the log when a run is in progress and show one readable dialog.
+            AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+                MainForm.ReportCrash("unhandled exception", e.ExceptionObject as Exception);
+            Application.ThreadException += (s, e) =>
+                MainForm.ReportCrash("UI thread exception", e.Exception);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
             Application.Run(new MainForm());
         }
     }
@@ -71,7 +85,44 @@ namespace ChameleonPatcherGui
         // streams and the run's own continuation stop touching a form that no longer exists.
         private bool closing;
 
+        // The live form, so the static crash handlers in Program can reach the log writer. Set in
+        // the MainForm constructor and cleared when the window is gone; a crash before the form
+        // exists, or after it is disposed, falls back to a dialog with no log write.
+        internal static MainForm Live;
+
         private const string PreparingText = "Checking...";
+
+        /// <summary>
+        /// Records a crash that escaped a handler and shows one readable dialog. Called by the
+        /// AppDomain and UI-thread handlers in Program. Writes to the run log when a run is in
+        /// progress, so a crash mid-patch leaves a trace instead of a silent log.
+        /// </summary>
+        internal static void ReportCrash(string context, Exception ex)
+        {
+            string text = ex == null ? "(no exception object)" : ex.ToString();
+            MainForm form = Live;
+            try
+            {
+                if (form != null && !form.IsDisposed && form.runLogOpen)
+                {
+                    form.LogLine("[crash]", context + ": " + text);
+                }
+            }
+            catch
+            {
+                // A log write failing must not replace the crash report with a second crash.
+            }
+            try
+            {
+                MessageBox.Show(
+                    "Chameleon Patcher hit an unexpected error (" + context + ").\n\n" + text +
+                    (form != null && form.runLogOpen ? "\n\nThe run log was updated with this." : ""),
+                    "Unexpected error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch
+            {
+            }
+        }
 
         // Set from the child's output callbacks (threadpool threads) when the pipeline stops
         // because the signing key is not on this PC and a .pfx password is needed. The failure
@@ -85,10 +136,14 @@ namespace ChameleonPatcherGui
         private readonly object logLock = new object();
         private Stopwatch runClock;
 
+        // True while a run log is open, so the crash handlers know a log write is meaningful.
+        internal bool runLogOpen;
+
         public MainForm()
         {
             // This exe lives at the project root; the pipeline scripts live in .\Scripts.
             scriptsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Scripts");
+            Live = this;
             BuildUi();
         }
 
@@ -356,6 +411,10 @@ namespace ChameleonPatcherGui
                 LogLine("[abort]", stopped ? "pipeline process tree stopped" : "could not confirm the pipeline process tree stopped");
                 FinishLog(-1, "ABORTED - window closed mid-run; the output folder is incomplete");
             }
+
+            // The form is going away: detach the static crash handlers from it so a late crash
+            // reports a dialog only, rather than writing into a disposed form's log.
+            if (Live == this) Live = null;
         }
 
         /// <summary>
@@ -451,6 +510,16 @@ namespace ChameleonPatcherGui
             {
                 // Includes ObjectDisposedException: the handle went away between the check and the post.
             }
+        }
+
+        /// <summary>
+        /// Asks the pipeline to resolve its external tools (-CheckPatchTools) and returns its
+        /// stdout, or null if the question could not be answered. Touches nothing on disk, so this
+        /// is safe to call before a run.
+        /// </summary>
+        private string CheckPatchToolsQuery()
+        {
+            return QueryPipeline("-CheckPatchTools", null, false, false);
         }
 
         /// <summary>
@@ -659,6 +728,7 @@ namespace ChameleonPatcherGui
                 AppendLog("[warn] Could not open a log file in any of the candidate locations; this run is not being logged to disk.");
                 return;
             }
+            runLogOpen = true;
 
             bool elevated = false;
             try
@@ -827,6 +897,7 @@ namespace ChameleonPatcherGui
                     }
                     logWriter = null;
                 }
+                runLogOpen = false;
             }
 
             PruneOldLogs();
@@ -1029,6 +1100,41 @@ namespace ChameleonPatcherGui
             {
                 MessageBox.Show(this, "Could not find Invoke-DriverPatchPipeline.ps1 in the Scripts folder next to this program:\n" + pipelineScript, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
+            }
+
+            // Ask the pipeline which tools this machine can resolve, before anything is unpacked.
+            // Inf2Cat and signtool have no substitute (editing INFs invalidates nv_disp.cat and
+            // only Inf2Cat rebuilds it), so a missing SDK is a dead run - and the catalog rebuild
+            // is the step that takes tens of minutes, so finding that out afterwards is expensive.
+            // The pipeline owns the rules; this only asks and reports.
+            string toolReport = await Task.Run(() => CheckPatchToolsQuery());
+            if (toolReport != null && toolReport.StartsWith("TOOLS_MISSING"))
+            {
+                string detail = toolReport.Replace("\r\n", "\n").Trim();
+                var lines = detail.Split('\n');
+                var sb = new StringBuilder();
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    if (lines[i].Trim().Length == 0) continue;
+                    sb.AppendLine(lines[i].Trim());
+                }
+                MessageBox.Show(
+                    this,
+                    "This machine is missing tools the patcher cannot work without:\n\n" + sb.ToString().TrimEnd() +
+                    "\n\nNothing has been unpacked and nothing was changed. Install what is listed " +
+                    "above, then start the run again.",
+                    "Required tools missing",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                lblStatus.ForeColor = System.Drawing.Color.DarkRed;
+                lblStatus.Text = "Required tools missing - see the message.";
+                return;
+            }
+            // A missing 7-Zip is not a failure: the pipeline falls back to NVIDIA's own installer.
+            // Mention it once, quietly, so the slower route is not a surprise mid-run.
+            if (toolReport != null && toolReport.Contains("7z:       not installed"))
+            {
+                lblStatus.ForeColor = System.Drawing.Color.DarkOrange;
+                lblStatus.Text = "No 7-Zip found - unpacking via NVIDIA's installer (slower).";
             }
 
             var argsBuilder = new StringBuilder();

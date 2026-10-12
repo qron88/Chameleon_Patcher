@@ -10,9 +10,11 @@
 
   Provides:
     Find-SevenZip            - locate a 7z-compatible CLI
+    Find-NvidiaSetupExe      - locate NVIDIA's own installer, the 7z-free unpack route
     Find-WdkTool             - locate a Windows Kits tool (Inf2Cat.exe / signtool.exe)
     Assert-PatchTools        - resolve everything up front so a missing tool fails in seconds
                                instead of after a multi-GB unpack/copy
+    Get-MissingToolHelp      - plain-language install guidance for a tool that was not found
     Invoke-NativeTool        - run a native exe and return its exit code, without letting its
                                stderr become a terminating error
     Resolve-WhitelistInf     - map a whitelist.json INF name onto the file this driver release
@@ -104,6 +106,37 @@ function Find-SevenZip {
     throw "No 7z-compatible CLI found (checked the WindowsApps alias, 7-Zip/NanaZip under Program Files, and PATH). Install 7-Zip or NanaZip."
 }
 
+function Find-NvidiaSetupExe {
+    <#
+      Locates NVIDIA's own installer (setup.exe), which is the 7z-free way to unpack a driver
+      download: `setup.exe -x -s` expands the package without installing anything.
+
+      This exists so a machine with no 7-Zip and no NanaZip is not blocked from the normal
+      "-SourceExePath" workflow. It is the fallback, not the first choice: 7z extracts straight
+      into a folder you name, while NVIDIA's installer expands to its own fixed location under
+      the current volume's root, so the caller moves the result afterwards.
+
+      Two locations are checked, in the order NVIDIA's installer itself uses:
+        C:\NVIDIA\DisplayDriver\<version>\<os>\Current\setup.exe   - the default expansion root
+        %TEMP%\NVIDIA Display Operation Server\<id>\64\setup.exe   - what the SFX drops when you
+                                                                       run the download normally
+      Returns $null when neither exists. That is not an error here: it means the fallback is
+      unavailable on this machine, and the caller decides what to do about it.
+    #>
+    $candidates = @(
+        'C:\NVIDIA\DisplayDriver',
+        (Join-Path $env:TEMP 'NVIDIA Display Operation Server')
+    )
+    foreach ($root in $candidates) {
+        if (-not $root -or -not (Test-Path $root)) { continue }
+        $hit = Get-ChildItem -Path $root -Filter 'setup.exe' -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
 function Find-WdkTool {
     <#
       Locates a Windows Kits tool, preferring the NEWEST SDK version and, within that version,
@@ -174,11 +207,61 @@ function Find-WdkTool {
     throw "$ExeName not found under Windows Kits (checked `$env:WDKContentRoot, Program Files (x86)/Program Files Windows Kits\10\bin, and PATH). Install the Windows Driver Kit / SDK, or pass an explicit path."
 }
 
+function Get-MissingToolHelp {
+    <#
+      Plain-language guidance for a tool that could not be found, for use in the message that
+      refuses the run. The point is that the user gets an install command, not a stack trace:
+      the two hard dependencies (Inf2Cat, signtool) both come from the Windows SDK, which is a
+      multi-GB install, and the old message said "Windows Driver Kit / SDK" - which reads as
+      heavier than what is actually needed. Only the SDK is required; a full WDK is not.
+    #>
+    param([string[]]$ToolNames)
+
+    $lines = @()
+    foreach ($t in $ToolNames) {
+        switch ($t) {
+            'Inf2Cat.exe' {
+                $lines += "Inf2Cat.exe - rebuilds nv_disp.cat after the INFs are edited. Ships in the"
+                $lines += "  Windows SDK, as its 'Windows Driver Kit' feature. A full Windows Driver"
+                $lines += "  Kit install is NOT needed - the SDK alone is enough. Install the SDK from:"
+                $lines += "    https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+                $lines += "  and keep the 'Windows Driver Kit' feature selected."
+            }
+            'signtool.exe' {
+                $lines += "signtool.exe - signs the rebuilt catalog. Ships in the Windows SDK, as its"
+                $lines += "  'Windows SDK Signing Tools' feature. Install the SDK from:"
+                $lines += "    https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+                $lines += "  and keep 'Windows SDK Signing Tools' selected."
+            }
+            '7z' {
+                $lines += "A 7z-compatible CLI is not installed, so the driver download will be unpacked"
+                $lines += "  by NVIDIA's own installer (setup.exe -x -s) instead. That works with nothing"
+                $lines += "  installed, is just slower, and needs the download to run on this machine."
+                $lines += "  For the faster route, install 7-Zip:"
+                $lines += "    winget install -e --id 7zip.7zip"
+            }
+            default {
+                $lines += "$t - not found. Pass an explicit path, or install the Windows SDK from:"
+                $lines += "    https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/"
+            }
+        }
+        $lines += ""
+    }
+    return $lines
+}
+
 function Assert-PatchTools {
     <#
       Resolves every external tool a run will need BEFORE any unpacking/copying happens, so a
       missing SDK fails in seconds rather than after a multi-GB extraction. Returns a hashtable
       of the resolved paths.
+
+      7-Zip is deliberately NOT a hard requirement. It is the fast unpack route; NVIDIA's own
+      installer is the fallback, so a machine with no third-party tool installed can still patch
+      a driver download. When 7-Zip is missing, SevenZip is $null, NvidiaSetupExe carries the
+      fallback (or $null if the download cannot run here), and the caller reports which route it
+      is taking. Inf2Cat and signtool have no fallback - editing INFs invalidates nv_disp.cat,
+      and Inf2Cat is the only tool that rebuilds it - so those still throw.
     #>
     param(
         [switch]$NeedSevenZip,
@@ -189,10 +272,36 @@ function Assert-PatchTools {
 
     $resolved = @{}
     if ($NeedSevenZip) {
-        $resolved['SevenZip'] = Find-SevenZip -ExplicitPath $SevenZipPath
+        # An explicit path is a hard request: if the caller named a CLI, use it and fail loudly
+        # when it is not there, rather than quietly substituting a different route.
+        if ($SevenZipPath) {
+            $resolved['SevenZip'] = Find-SevenZip -ExplicitPath $SevenZipPath
+            $resolved['NvidiaSetupExe'] = $null
+        }
+        else {
+            # No explicit CLI named. Try the fast route, and fall back to NVIDIA's own installer
+            # so a machine with nothing third-party installed is not blocked from patching a
+            # driver download. Both routes are reported by the caller; the fallback is slower and
+            # expands to NVIDIA's fixed location, so it is not the preferred one.
+            $seven = $null
+            try { $seven = Find-SevenZip } catch { $seven = $null }
+            $resolved['SevenZip'] = $seven
+            $resolved['NvidiaSetupExe'] = if ($seven) { $null } else { Find-NvidiaSetupExe }
+        }
     }
-    $resolved['Inf2Cat']  = Find-WdkTool -ExeName 'Inf2Cat.exe'  -ExplicitPath $Inf2CatPath
-    $resolved['SignTool'] = Find-WdkTool -ExeName 'signtool.exe' -ExplicitPath $SignToolPath
+
+    $missing = @()
+    $inf2cat = $null; $signtool = $null
+    try { $inf2cat = Find-WdkTool -ExeName 'Inf2Cat.exe'  -ExplicitPath $Inf2CatPath }  catch { $missing += 'Inf2Cat.exe' }
+    try { $signtool = Find-WdkTool -ExeName 'signtool.exe' -ExplicitPath $SignToolPath } catch { $missing += 'signtool.exe' }
+
+    if ($missing.Count -gt 0) {
+        $help = Get-MissingToolHelp -ToolNames $missing
+        throw ("Required tools not found:`n" + ($help -join "`n") + "`nChecked `$env:WDKContentRoot, Windows Kits\10\bin under Program Files (x86) and Program Files, and PATH. Pass -Inf2CatPath / -SignToolPath to point at them directly.")
+    }
+
+    $resolved['Inf2Cat']  = $inf2cat
+    $resolved['SignTool'] = $signtool
     return $resolved
 }
 

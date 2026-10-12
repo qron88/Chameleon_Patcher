@@ -73,6 +73,13 @@
   anything. First line is SUPPORTED, UNSUPPORTED or UNKNOWN (nothing detectable to judge),
   followed by human-readable detail. Used by the GUI so the rule lives in exactly one place.
 
+.PARAMETER CheckPatchTools
+  Print which external tools this machine can resolve and stop, without touching anything.
+  Reports Inf2Cat, signtool, a 7z-compatible CLI, and NVIDIA's installer as the 7z-free unpack
+  fallback. A missing 7-Zip is reported as a note, not a failure - the fallback covers it. A
+  missing Inf2Cat or signtool is a failure, and the report carries the install command for it.
+  Used by the GUI so the tool rules live in exactly one place.
+
 .PARAMETER KeepInf
   Extra INFs to protect from -PruneForeignOemInfs, by filename or bare stem.
 
@@ -82,7 +89,9 @@
 
 .PARAMETER SourceExePath
   Path to a downloaded NVIDIA driver installer .exe (a self-extracting 7z archive). Mutually
-  exclusive with -SourcePackagePath.
+  exclusive with -SourcePackagePath. Unpacking needs a 7z-compatible CLI for the fast route, or
+  nothing at all: with no 7-Zip installed the pipeline falls back to NVIDIA's own installer
+  (`setup.exe -x -s`), which expands the package without installing it. See Unpack-DriverExe.ps1.
 
 .PARAMETER SourcePackagePath
   Root of an ALREADY-UNPACKED stock NVIDIA driver package (must contain setup.exe, setup.cfg,
@@ -161,6 +170,10 @@ param(
     # -ShowOutputPath: the GUI asks rather than reimplementing the rule in C#.
     [switch]$CheckLocalGpuSupport,
 
+    # Print this machine's tool-availability report and stop. Same reasoning again - the GUI asks,
+    # so the SDK/7-Zip rules are not duplicated in C# where they can drift from the pipeline.
+    [switch]$CheckPatchTools,
+
     [string[]]$KeepInf = @(),
 
     [switch]$SkipOptionalComponents,
@@ -231,6 +244,27 @@ if ($CheckLocalGpuSupport) {
     $support = Get-LocalGpuSupportReport -Path $WhitelistPath
     Write-Output $support.Verdict
     foreach ($l in $support.Detail) { Write-Output $l }
+    return
+}
+
+if ($CheckPatchTools) {
+    # The same discovery the preflight uses, so the GUI's answer and the run's behaviour cannot
+    # drift apart. Inf2Cat/signtool are hard requirements with no substitute; 7-Zip is not,
+    # because NVIDIA's own installer covers unpacking when it is absent.
+    $inf2cat  = $null; $signtool = $null; $seven = $null; $setup = $null
+    $missingHard = @()
+    try { $inf2cat  = Find-WdkTool -ExeName 'Inf2Cat.exe' }  catch { $missingHard += 'Inf2Cat.exe' }
+    try { $signtool = Find-WdkTool -ExeName 'signtool.exe' } catch { $missingHard += 'signtool.exe' }
+    try { $seven = Find-SevenZip } catch { $seven = $null }
+    if (-not $seven) { $setup = Find-NvidiaSetupExe }
+
+    if ($missingHard.Count -gt 0) { Write-Output 'TOOLS_MISSING' } else { Write-Output 'TOOLS_OK' }
+    Write-Output ("  Inf2Cat:  " + $(if ($inf2cat) { $inf2cat } else { 'NOT FOUND' }))
+    Write-Output ("  signtool: " + $(if ($signtool) { $signtool } else { 'NOT FOUND' }))
+    Write-Output ("  7z:       " + $(if ($seven) { $seven } elseif ($setup) { 'not installed - unpacking via NVIDIA installer' } else { 'not installed - no unpack fallback found on this machine' }))
+    foreach ($m in $missingHard) {
+        foreach ($h in (Get-MissingToolHelp -ToolNames @($m))) { Write-Output $h }
+    }
     return
 }
 
@@ -344,7 +378,16 @@ What you probably want instead:
 Write-Host "Preflight: checking tools and signing identity..." -ForegroundColor DarkGray
 
 $tools = Assert-PatchTools -NeedSevenZip:$usingExe -Inf2CatPath $Inf2CatPath -SignToolPath $SignToolPath
-if ($usingExe) { Write-Host "  7z:       $($tools.SevenZip)" -ForegroundColor DarkGray }
+if ($usingExe) {
+    if ($tools.SevenZip) {
+        Write-Host "  7z:       $($tools.SevenZip)" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "  7z:       none found - unpacking via NVIDIA's installer (setup.exe -x -s) instead" -ForegroundColor DarkGray
+        Write-Host "            slower, and needs the download on this machine; install 7-Zip for the" -ForegroundColor DarkGray
+        Write-Host "            fast route:  winget install -e --id 7zip.7zip" -ForegroundColor DarkGray
+    }
+}
 Write-Host "  Inf2Cat:  $($tools.Inf2Cat)" -ForegroundColor DarkGray
 Write-Host "  signtool: $($tools.SignTool)" -ForegroundColor DarkGray
 

@@ -9,6 +9,10 @@ Certificates/
 # Tool state
 .claude/
 
+# Scratch folders used by local testing
+.tmptest/
+.tmptest-build.exe
+
 # Local backup archives
 backup/
 

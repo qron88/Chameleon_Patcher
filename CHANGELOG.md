@@ -7,6 +7,84 @@ All notable changes to Project Chameleon are recorded here. The format follows
 The version is declared in the assembly attributes at the top of `Source\Chameleon-Patcher.cs`
 and nowhere else; see [Version](README.md#version).
 
+## [1.0.4] - 2026-10-12
+
+### Added
+
+- **Unpacking no longer requires a 7z-compatible CLI.** `Unpack-DriverExe.ps1` has a second
+  route: NVIDIA's own installer, `setup.exe -x -s`, which expands the package without installing
+  a driver. A machine with neither 7-Zip nor NanaZip installed can now patch a downloaded driver
+  `.exe`. 7z stays the preferred route - it extracts straight into the folder you name, runs
+  nothing, and is faster; the installer route expands to NVIDIA's fixed location under the volume
+  root (`C:\NVIDIA\DisplayDriver\<version>\<os>\Current`) and the result is copied into the
+  output folder, and it runs the downloaded installer, so it needs the download on this machine.
+  Discovery checks `C:\NVIDIA\DisplayDriver` and the `NVIDIA Display Operation Server` temp
+  folder; `-SetupExePath` names the installer explicitly. The expansion is polled on the marker
+  file rather than slept on, so a 1 GB package is not bounded by a fixed delay, and a failed
+  expansion still removes the partial output folder.
+- **`-CheckPatchTools` on the pipeline** prints `TOOLS_OK` / `TOOLS_MISSING` with each resolved
+  tool path and the install command for anything missing, touching nothing on disk. The GUI asks
+  this before starting a run, so the SDK/7-Zip rules live in the pipeline and are not duplicated
+  in C# where they could drift.
+- **The GUI refuses to start a run it cannot finish, and says what to install.** A missing
+  `Inf2Cat` or `signtool` - the two dependencies with no substitute - now stops before anything
+  is unpacked, with a dialog naming each tool and carrying its install command, and stating that
+  nothing was changed. Previously that only surfaced in the log, after the run had begun, and the
+  catalog rebuild is the step that takes tens of minutes. A missing 7-Zip is not a refusal: the
+  status line notes the slower fallback route and the run proceeds.
+- **`Get-MissingToolHelp`** turns a missing tool into install guidance inside the message that
+  refuses the run, replacing a "not found under Windows Kits" with what to do about it. The SDK
+  guidance names the two features that matter — **Windows Driver Kit** for `Inf2Cat.exe` and
+  **Windows SDK Signing Tools** for `signtool.exe` — and links Microsoft's SDK download page;
+  those feature names were read out of a real SDK install, not guessed. 7-Zip keeps a `winget`
+  command.
+- **Global crash handlers in the GUI.** `AppDomain.UnhandledException` and
+  `Application.ThreadException` are hooked. An exception escaping an `async void` handler
+  (`BtnStart_Click` is one) used to be rethrown on the Windows message loop and take the app down
+  as a raw Win32 crash - no message, and the run's log ending mid-patch with no recorded reason.
+  A crash now writes a `[crash]` line into the run log when one is open and shows one readable
+  dialog. The log is this tool's primary diagnostic artifact, so a crash that leaves it silent was
+  the worst available failure mode.
+- **A verified driver-release matrix in the README** - see
+  [Verified driver releases](README.md#verified-driver-releases): 595.79, 616.86, 616.92, 617.14
+  and 617.42, each with the toolkit version, the build type, the verification gate's own verdict
+  and the outcome, with the 617.x rows read out of the run logs. It states what "verified" covers
+  (pipeline completed, gate passed, catalog signed) and what it does not (installed and driven on
+  real hardware), and says plainly that Blackwell is out of scope.
+
+### Changed
+
+- **The README no longer claims "on any driver version".** The patching is *built* for any
+  release - no hardcoded section numbers, stem-based INF filename resolution - which is not the
+  same as being verified on one, and the old wording let the two read as a single claim. The
+  intro, the file table and the usage section now point at the verified-release matrix, and the
+  usage section names `Patch verification PASSED - N/N whitelist entries in place` as the line to
+  check on an unlisted release. That is the failure NVIDIA's INF renames used to produce: a
+  package that unpacks, patches, signs and installs cleanly with no unlock in it at all.
+- **The dependency list is now the minimum install, not a survey.** One section separates what
+  Windows 11 already ships (PowerShell 5.1, .NET Framework 4.x, `certutil`, the PKI module,
+  `Get-CimInstance`) from the one thing you install: the **Windows SDK**. The old text said
+  "Windows SDK/WDK", which reads as a heavier install than is needed - a full Windows Driver Kit
+  is not required. `Inf2Cat.exe` ships in the SDK's Windows Driver Kit feature and `signtool.exe`
+  in Desktop Core Tools. 7-Zip moved from a requirement to an optional speed option.
+- **PowerShell 7 is documented as a deliberate non-dependency.** The scripts use no PS 7-only
+  syntax, PS 7 is an optional install rather than part of Windows, and the goal is the lowest bar
+  for the end user, so requiring it would add an install for no benefit. `Invoke-NativeTool`
+  already works around a PS 5.1 quirk (redirecting a native command's stderr under
+  `$ErrorActionPreference = 'Stop'` wraps each line in a `NativeCommandError` and aborts the
+  script even when the exe returned 0), and that workaround stays.
+
+### Fixed
+
+- **A missing SDK was reported one tool at a time, and only from the pipeline.**
+  `Assert-PatchTools` resolved `Inf2Cat` and `signtool` through direct calls, so the first missing
+  tool threw and the second was never reported - a machine with no SDK got one message, installed
+  half of what it needed, and hit the next one later. Both are now resolved independently and
+  reported together.
+- **A 7z path passed explicitly could be silently replaced.** With `-SevenZipPath` naming a CLI
+  that does not exist, the new fallback logic would have quietly switched to the installer route.
+  Naming a CLI is a hard request: it now fails loudly with the path it could not find.
+
 ## [1.0.3] - 2026-10-07
 
 ### Fixed
