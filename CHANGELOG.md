@@ -7,6 +7,59 @@ All notable changes to Project Chameleon are recorded here. The format follows
 The version is declared in the assembly attributes at the top of `Source\Chameleon-Patcher.cs`
 and nowhere else; see [Version](README.md#version).
 
+## [Unreleased]
+
+### Added
+
+- **Tests for the INF text handling.** `Tests\PatchToolDiscovery.Tests.ps1` covers the shared
+  helpers - the section-index walk, device-line matching, `whitelist.json`-to-INF filename
+  resolution, reading a certificate thumbprint from a `.cer`, the driver-version parsing, and the
+  unpack version guard. `Tests\InfPatchIntegrity.Tests.ps1` builds a synthetic `Display.Driver`
+  package, runs the real patchers against it and the verification gate before and after, and
+  asserts that the insertions land with the section bodies rather than in the blank gap after them,
+  that the patched package passes the gate, that a second pass leaves the file byte-identical, and
+  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. 47
+  cases, in Pester 3.4 syntax so they run on PowerShell 5.1 and 7 alike. They paid for themselves
+  the day they were written: the section-index helper had been declared with a `[string[]]`
+  parameter, and PowerShell refuses to bind an array containing an empty string to one - which
+  describes every real INF file, so all three writers would have thrown on the first blank line of
+  any real package. The tests caught it before it shipped.
+- **The installer checkbox refuses the wrong certificate.** `Add-SetupCertOption.ps1` takes
+  `-ExpectThumbprint`, defaulting to the certificate that actually signs the package's `.cat`
+  files, and throws if the `.cer` it is about to bind differs. Left ticked, that checkbox trusts
+  whatever it is handed into `Root` and `TrustedPublisher`, so a stale or hand-picked `.cer` used to
+  buy machine-wide trust for a key with no connection to the package being installed.
+- **Continued INF lines are reported rather than read past.** `Test-DriverPatch.ps1` warns with the
+  count and line numbers when the sections this toolkit patches contain trailing-backslash
+  continuations. Every matcher here reads one physical line at a time, so a device entry, a
+  `[Strings]` definition or an `RM1457588` override split across two lines is invisible to the
+  check that certifies it.
+- **Shared primitives in `PatchToolDiscovery.ps1`.** `Get-InfSectionIndex` (where an inserted line
+  lands inside a section), one `[section]` header pattern, `Test-InfLineContinuations`,
+  `Get-InfDeviceLine` / `Test-InfDeviceIdMatch` extended to `[Strings]` and misc-section lookups,
+  `Get-CerThumbprint -Path`, and `Get-DriverVersionTextFromPath` / `Get-PathVersionForSort`.
+
+### Changed
+
+- The whitelist patcher, the RM override and the verification gate now share one section header
+  pattern and one section-index walk instead of each carrying its own header regex, so they cannot
+  disagree about where an inserted line goes or about where a section ends.
+- `Unpack-DriverExe.ps1` picks the newest expansion by driver *version* rather than by name or
+  write time, and `Find-NvidiaSetupExe` prefers a setup.exe whose version matches the download
+  being unpacked.
+
+### Fixed
+
+- **A run could silently patch the wrong driver.** With no 7z-compatible CLI installed, the
+  installer route expands into `C:\NVIDIA\DisplayDriver\<version>\<os>\Current` and the script then
+  chose the newest-looking folder under that root without comparing it to the version the requested
+  `.exe` names. An older expansion left there by a previous run - or one the installer reused -
+  meant the older package was copied, patched, verified and signed, and came out looking finished:
+  every check inside the gate passes, because the package is internally consistent, and the unlock
+  for the driver you actually asked for is simply not there. The expansion is now checked against
+  the requested version and the run stops with an explanation (and a warning when neither side
+  names a version).
+
 ## [1.0.4] - 2026-10-12
 
 ### Added

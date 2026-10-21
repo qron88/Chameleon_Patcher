@@ -70,6 +70,9 @@ Chameleon_Project\
 │  ├─ PatchToolDiscovery.ps1
 │  ├─ whitelist.json
 │  └─ templates\GpuUnlockCert.nvi.template
+├─ Tests\                   <- Pester tests for the INF text handling; run: Invoke-Pester Tests
+│  ├─ PatchToolDiscovery.Tests.ps1
+│  └─ InfPatchIntegrity.Tests.ps1
 └─ Certificates\            <- created automatically the first time a cert is needed
    ├─ DriverPatchSigning_<thumbprint>.cer  <- public cert, one file per minted certificate
    ├─ DriverPatchSigning.cer   <- legacy fixed name (versions before 1.0.2); still honoured
@@ -94,7 +97,7 @@ script that regenerates the `.ico` and `.png` from it.
 | `Source\Chameleon-Patcher.cs` | The GUI's source. Version attributes sit at the top of the file and are the single place the release number is declared - see [Version](#version). |
 | `Source\Build.ps1` | Rebuilds the `.exe` into the project root with `csc.exe` and prints the version resource it produced. |
 | `Scripts\Invoke-DriverPatchPipeline.ps1` | All-in-one: unpack → patch → sign → add the installer checkbox, and prune old signing keys from `Cert:\CurrentUser\My` (see `-KeepAllOldCerts`). Takes either a raw downloaded `.exe` or an already-unpacked folder; result is always a plain folder. |
-| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). |
+| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). The installer route re-checks the expansion against the version the requested `.exe` names, because an older folder left under `C:\NVIDIA\DisplayDriver\` used to be copied, patched, verified and signed as though it were the download you asked for. |
 | `Scripts\Add-ExtraGpuSupport.ps1` | Applies `whitelist.json` to a stock `Display.Driver` folder. Does not hardcode section numbers, so it survives INF renumbering between releases, and resolves INF *filenames* by stem so it survives them being renamed too — see [When NVIDIA renames the INFs](#when-nvidia-renames-the-infs). Written for any driver version; only the releases in [Verified driver releases](#verified-driver-releases) have been run end to end. |
 | `Scripts\Add-RmCapabilityOverride.ps1` | Adds the `RM1457588` registry override to every `nv_miscBase_addreg__*` section in every driver INF - fixes VRAM size misreporting and broken compute on whitelisted GPUs. See [below](#why-vram-size--compute-needs-a-second-fix). |
 | `Scripts\Remove-ForeignOemInfs.ps1` | Drops the OEM display INFs that cannot match this machine, taking the catalog rebuild from ~50 min to ~7. Opt-in via `-PruneForeignOemInfs`. See [Making a run finish in minutes](#making-a-run-finish-in-minutes-instead-of-an-hour). |
@@ -102,12 +105,14 @@ script that regenerates the `.ico` and `.png` from it.
 | `Scripts\Test-DriverPatch.ps1` | Verifies a package really was patched, and is run **before signing** so a silently-unpatched package can't be signed and shipped as finished. See [The verification gate](#the-verification-gate). Also runnable standalone against any package. |
 | `Scripts\New-DriverSigningCert.ps1` | Generates a fresh, locally-owned self-signed code-signing cert (does **not** touch system trust stores). The key is **non-exportable** and stays in `Cert:\CurrentUser\My`, so there is no `.pfx` and no password at all. `-Exportable` opts into a portable `.pfx`. Defaults to a 3-year life. |
 | `Scripts\Sign-DriverPackage.ps1` | Rebuilds `nv_disp.cat` from the patched INFs (`Inf2Cat.exe`) and signs it (`signtool.exe`) with your cert. Signs **without any password** when the key is in your certificate store — see [Signing without a password](#signing-without-a-password). |
-| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, NVIDIA's `setup.exe`, `Inf2Cat.exe`, `signtool.exe`) and the install guidance shown when one is missing, dot-sourced by the others. The pipeline uses it to check every tool up front, so a missing SDK fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. |
-| `Scripts\Add-SetupCertOption.ps1` | Adds a "Chameleon GPU cert." component to `setup.exe`'s Custom Installation Options screen, **ticked by default** and still user-selectable; `-Unchecked` makes it opt-in. Left ticked, it trusts the certificate in `Root` and `TrustedPublisher`, like `Approve-DriverPatchCert.ps1`. The label lives in `templates\GpuUnlockCert.nvi.template`, the same string in every locale. |
+| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, NVIDIA's `setup.exe`, `Inf2Cat.exe`, `signtool.exe`) and the install guidance shown when one is missing, dot-sourced by the others. The pipeline uses it to check every tool up front, so a missing SDK fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. It also owns the INF text primitives every writer inserts through: `Get-InfSectionIndex` decides where a new line lands inside a section, the shared `[section]` header pattern keeps the patchers and the gate reading sections the same way, `Test-InfLineContinuations` reports trailing-backslash continuations, and the driver-version parsing sits behind the unpack guard. |
+| `Scripts\Add-SetupCertOption.ps1` | Adds a "Chameleon GPU cert." component to `setup.exe`'s Custom Installation Options screen, **ticked by default** and still user-selectable; `-Unchecked` makes it opt-in. Left ticked, it trusts the certificate in `Root` and `TrustedPublisher`, like `Approve-DriverPatchCert.ps1`. The label lives in `templates\GpuUnlockCert.nvi.template`, the same string in every locale. `-ExpectThumbprint` (default: the certificate that actually signs the package's `.cat` files) must match the `.cer` being bound, or the step throws. The checkbox hands whatever it is given to `Root` and `TrustedPublisher`, so this is what keeps an unrelated key out of the machine trust store. |
 | `Scripts\Approve-DriverPatchCert.ps1` | Standalone alternative to the installer checkbox: trusts the cert via a separate, explicit script you run yourself. Adds `Root` (makes the chain work) and `TrustedPublisher` (installs without a device-software prompt). By default it trusts the certificate the pipeline signs with. |
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
 | `Scripts\whitelist.json` | The device/subsystem whitelist data the patcher applies. |
 | `Scripts\templates\GpuUnlockCert.nvi.template` | The verified-working installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. |
+| `Tests\PatchToolDiscovery.Tests.ps1` | Pester cases for the shared helpers: the section-index walk, device-line matching, `whitelist.json`-to-INF resolution, the certificate thumbprint reader, the driver-version parsing, and the unpack version guard. |
+| `Tests\InfPatchIntegrity.Tests.ps1` | End-to-end cases against a synthetic `Display.Driver` package: the gate refuses it unpatched, the patchers produce a package the gate certifies, insertions land inside the section bodies rather than in the blank gap after them, and a second pass changes nothing. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
 Unpacking a downloaded `.exe` prefers a 7z-compatible CLI - this machine has NanaZip (a 7-Zip-
@@ -511,6 +516,50 @@ The two patchers also fail loudly rather than shrugging. `Add-ExtraGpuSupport.ps
 an INF has no `[NVIDIA_Devices*]` block at all, and `Add-RmCapabilityOverride.ps1` throws if no
 INF in the package has an `[nv_miscBase_addreg__NN]` section. Both of those mean "this driver
 release's layout is not what this script understands", which is worth stopping for.
+
+A package can also be *partly unreadable* rather than wrong, and the gate says so instead of
+certifying only what it managed to see. INF lines may be continued with a trailing backslash, and
+every matcher in this toolkit reads one physical line at a time, so a device entry, a `[Strings]`
+definition or an `RM1457588` override split across two lines is invisible to the very check that
+just certified it. The gate reports how many such lines sit inside the sections it patches, and
+where, as a warning. It does not fail the run - whether a given continuation matters is a human
+judgement - but it puts the possibility on the record before signing rather than leaving it to turn
+up as a missing unlock afterwards.
+
+## Tests
+
+The parts of this toolkit that decide *where a line goes in an INF* are pure text handling, which
+means they can be tested without a driver download, a certificate, or a machine willing to boot the
+result. `Tests\` holds Pester cases for exactly that:
+
+```powershell
+Invoke-Pester Tests                                # both files
+Invoke-Pester Tests\InfPatchIntegrity.Tests.ps1    # just the end-to-end one
+```
+
+`PatchToolDiscovery.Tests.ps1` covers the shared helpers, one behaviour per case: the section-index
+walk that decides whether an inserted line lands with the section body or in the blank gap before
+the next header; device-line matching, including a trailing comment and a `&REV_` line that must not
+count as the same hardware ID; `whitelist.json`-to-INF filename resolution across the renames
+releases have used; reading a certificate thumbprint from a `.cer`; and the unpack version guard.
+
+`InfPatchIntegrity.Tests.ps1` builds a small but structurally faithful `Display.Driver` folder in a
+temp directory - two `[NVIDIA_Devices*]` blocks, two `[nv_miscBase_addreg__NN]` sections whose
+bodies end in a comment line and a blank line, `[Strings]` last with a blank tail - then runs the
+real patchers against it and the gate before and after. The blank tails are deliberate: every
+insertion in the pipeline goes through one section-index walk, and a fixture without tails would not
+test the thing that differs between driver releases. It asserts that the gate refuses the unpatched
+package while naming both problems, that the entry lands in *both* device blocks, that the spliced
+`SectionExtraGPU*` family and its `[Strings]` definition sit inside their sections rather than under
+them, that the RM override appears exactly once per misc section and above that trailing comment,
+that the patched package then passes the gate, and that a second pass of both patchers leaves the
+file byte-identical. It also checks the INF is still BOM-less UTF-8 with CRLF endings after three
+different writers have opened it.
+
+Pester 3.4 is what ships with PowerShell 5.1, so the files use its syntax and run on 5.1 and 7 - the
+same two interpreters the scripts themselves have to work on. They are worth running before touching
+the section walk or the matching rules, which are the two places where a wrong answer looks exactly
+like a successful patch.
 
 ## Verified driver releases
 
