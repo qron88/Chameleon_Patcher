@@ -76,7 +76,7 @@ function Expand-BySevenZip {
 }
 
 function Expand-ByNvidiaInstaller {
-    param([string]$Installer, [string]$Source)
+    param([string]$Installer, [string]$Source, [string]$ExpectedVersion, [string[]]$Roots)
     Write-Host "Using NVIDIA installer expansion: $Installer" -ForegroundColor DarkGray
     Write-Host "  -x -s expands the package without installing anything. NVIDIA writes it under" -ForegroundColor DarkGray
     Write-Host "  the current volume's root (C:\NVIDIA\DisplayDriver\<version>\<os>\Current)." -ForegroundColor DarkGray
@@ -86,7 +86,9 @@ function Expand-ByNvidiaInstaller {
     # what makes this a real bound: a fixed sleep would either be too short for a 1 GB package or
     # a guaranteed stall on every run.
     $before = @{}
-    foreach ($root in @('C:\NVIDIA', (Join-Path $env:TEMP 'NVIDIA Display Operation Server'))) {
+    # NVIDIA's own fixed roots, and the single place both the snapshot below and the picker scan.
+    $roots = if ($Roots) { @($Roots) } else { @('C:\NVIDIA', (Join-Path $env:TEMP 'NVIDIA Display Operation Server')) }
+    foreach ($root in $roots) {
         if ($root -and (Test-Path $root)) {
             foreach ($f in @(Get-ChildItem -Path $root -Filter 'setup.cfg' -Recurse -File -ErrorAction SilentlyContinue)) {
                 $before[$f.FullName] = $f.LastWriteTime.Ticks
@@ -121,7 +123,7 @@ function Expand-ByNvidiaInstaller {
     $deadline = (Get-Date).AddMinutes(10)
     $expandedRoot = $null
     while ((Get-Date) -lt $deadline) {
-        $candidate = Find-NewestExpansion -Before $before
+        $candidate = Find-NewestExpansion -Before $before -ExpectedVersion $ExpectedVersion -Roots $roots
         if ($candidate) { $expandedRoot = $candidate; break }
         Start-Sleep -Milliseconds 1500
     }
@@ -170,7 +172,15 @@ function Assert-ExpandedVersionMatchesRequest {
         Write-Warning "NVIDIA's expansion folder $ExpandedRoot does not name a driver version, so it could not be checked against the requested version $requested. Check the package version before signing it."
         return
     }
-    if ($actual -ne $requested) {
+    # Compared as versions, not as texts. The download names itself 617.42 while the same branch
+    # can sit on disk as 617.42.0.0, and [version] does not read the missing parts as zero, so both
+    # sides need normalizing first. Comparing the texts stops a run that asked for one driver and
+    # got exactly that driver, which is how a safety net becomes the reason people disable it.
+    $actualVersion = Get-NormalizedDriverVersion -Text $actual
+    $requestedVersion = Get-NormalizedDriverVersion -Text $requested
+    if ($actualVersion -and $requestedVersion) { $sameVersion = ($actualVersion -eq $requestedVersion) }
+    else { $sameVersion = ($actual -eq $requested) }
+    if (-not $sameVersion) {
         throw @"
 NVIDIA's installer route produced an expansion of driver version $actual ($ExpandedRoot), but the requested download is driver version $requested : $RequestedExePath.
 
@@ -187,27 +197,46 @@ function Find-NewestExpansion {
       Newest setup.cfg under NVIDIA's expansion roots that was not present (or was not modified)
       before the installer was launched. setup.cfg is the last thing the expansion writes, so its
       appearance is the completion signal.
+
+      -ExpectedVersion prefers an expansion whose path names the version this run was asked for.
+      A timestamp alone cannot tell the fresh expansion from a cached one: a copy, an antivirus
+      scan or a second installer run for a DIFFERENT version also moves a setup.cfg timestamp
+      under C:\NVIDIA\DisplayDriver\<version>\, and picking that folder is what
+      Assert-ExpandedVersionMatchesRequest then has to catch. NVIDIA writes the version into the
+      path, so the path settles the question the timestamp only guesses at. Where no candidate
+      names the version (the %TEMP% route does not), the timestamp pick is all there is, and the
+      version check is what stands between a wrong package and a signed one.
     #>
-    param([hashtable]$Before)
-    $newest = $null
-    foreach ($root in @('C:\NVIDIA', (Join-Path $env:TEMP 'NVIDIA Display Operation Server'))) {
+    param([hashtable]$Before, [string]$ExpectedVersion, [string[]]$Roots)
+    # NVIDIA's own fixed roots; -Roots exists only so the pick can be tested against a scratch tree.
+    $roots = if ($Roots) { @($Roots) } else { @('C:\NVIDIA', (Join-Path $env:TEMP 'NVIDIA Display Operation Server')) }
+    $fresh = @()
+    foreach ($root in $roots) {
         if (-not $root -or -not (Test-Path $root)) { continue }
         foreach ($f in @(Get-ChildItem -Path $root -Filter 'setup.cfg' -Recurse -File -ErrorAction SilentlyContinue)) {
             if ($Before.ContainsKey($f.FullName) -and $Before[$f.FullName] -eq $f.LastWriteTime.Ticks) { continue }
-            if (-not $newest -or $f.LastWriteTime -gt $newest.LastWriteTime) { $newest = $f }
+            $fresh += $f
         }
     }
-    if (-not $newest) { return $null }
+    if ($fresh.Count -eq 0) { return $null }
+    $pick = if ($ExpectedVersion) { @($fresh | Where-Object { $_.FullName -like "*$ExpectedVersion\*" }) } else { $fresh }
+    if ($pick.Count -eq 0) { $pick = $fresh }
+    $newest = $null
+    foreach ($f in $pick) {
+        if (-not $newest -or $f.LastWriteTime -gt $newest.LastWriteTime) { $newest = $f }
+    }
     return (Split-Path $newest.DirectoryName -Parent)
 }
 
 # --- Route selection --------------------------------------------------------------------------
 # 7z first: it is faster, extracts to the exact folder requested, and runs nothing. The
 # installer route is the fallback that keeps 7-Zip off the list of hard requirements.
-# The fallback picks an expansion by timestamp, which is why it also verifies the version it ended
-# up with - see Assert-ExpandedVersionMatchesRequest below, and the -ExpectedVersion filter it asks
-# discovery for. A cached C:\NVIDIA folder of another driver version is otherwise
-# indistinguishable from the payload of the download this run was asked to patch.
+# The fallback asks for the version it was given: NVIDIA puts the version into the expansion path,
+# so the pick prefers a path naming that version over one whose timestamp is merely the newest
+# (Find-NewestExpansion), and it then verifies what it ended up with
+# (Assert-ExpandedVersionMatchesRequest) for the cases where no path names a version at all. A
+# cached C:\NVIDIA folder of another driver version is otherwise indistinguishable from the
+# payload of the download this run was asked to patch.
 $sevenZip = $null
 if ($SevenZipPath) {
     $sevenZip = Find-SevenZip -ExplicitPath $SevenZipPath
@@ -215,6 +244,11 @@ if ($SevenZipPath) {
 else {
     try { $sevenZip = Find-SevenZip } catch { $sevenZip = $null }
 }
+# The version the requested download names in its own file name. It is asked for twice: to prefer
+# the setup.exe of that version, and to prefer the expansion folder of that version. Both NVIDIA
+# roots carry it in the path, which is the only thing that separates the payload of this run from
+# a cached expansion of some other version whose timestamp just happened to move.
+$requestedVersion = Get-DriverVersionTextFromPath -Path $ExePath
 
 $installer = $null
 if (-not $sevenZip) {
@@ -223,7 +257,7 @@ if (-not $sevenZip) {
         (Resolve-Path $SetupExePath).Path
     }
     else {
-        Find-NvidiaSetupExe -ExpectedVersion (Get-DriverVersionTextFromPath -Path $ExePath)
+        Find-NvidiaSetupExe -ExpectedVersion $requestedVersion
     }
 }
 
@@ -246,7 +280,7 @@ try {
         Expand-BySevenZip -Cli $sevenZip -Source $ExePath -Dest $OutputPath
     }
     else {
-        $expanded = Expand-ByNvidiaInstaller -Installer $installer -Source $ExePath
+        $expanded = Expand-ByNvidiaInstaller -Installer $installer -Source $ExePath -ExpectedVersion $requestedVersion
         if (-not (Test-ExpandedPackageRoot $expanded)) {
             throw "NVIDIA expanded to $expanded, which does not look like a driver package root (expected setup.exe, setup.cfg, Display.Driver)."
         }
