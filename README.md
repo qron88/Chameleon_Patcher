@@ -97,7 +97,7 @@ script that regenerates the `.ico` and `.png` from it.
 | `Source\Chameleon-Patcher.cs` | The GUI's source. Version attributes sit at the top of the file and are the single place the release number is declared - see [Version](#version). |
 | `Source\Build.ps1` | Rebuilds the `.exe` into the project root with `csc.exe` and prints the version resource it produced. |
 | `Scripts\Invoke-DriverPatchPipeline.ps1` | All-in-one: unpack → patch → sign → add the installer checkbox, and prune old signing keys from `Cert:\CurrentUser\My` (see `-KeepAllOldCerts`). Takes either a raw downloaded `.exe` or an already-unpacked folder; result is always a plain folder. |
-| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). The installer route re-checks the expansion against the version the requested `.exe` names, because an older folder left under `C:\NVIDIA\DisplayDriver\` used to be copied, patched, verified and signed as though it were the download you asked for. |
+| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). Both places where the installer route picks a folder out of `C:\NVIDIA\DisplayDriver\` ask for the version the requested `.exe` names, and the expansion is then re-checked against it, because an older folder left there - or one whose timestamp moved for an unrelated reason - used to be copied, patched, verified and signed as though it were the download you asked for. |
 | `Scripts\Add-ExtraGpuSupport.ps1` | Applies `whitelist.json` to a stock `Display.Driver` folder. Does not hardcode section numbers, so it survives INF renumbering between releases, and resolves INF *filenames* by stem so it survives them being renamed too — see [When NVIDIA renames the INFs](#when-nvidia-renames-the-infs). Written for any driver version; only the releases in [Verified driver releases](#verified-driver-releases) have been run end to end. |
 | `Scripts\Add-RmCapabilityOverride.ps1` | Adds the `RM1457588` registry override to every `nv_miscBase_addreg__*` section in every driver INF - fixes VRAM size misreporting and broken compute on whitelisted GPUs. See [below](#why-vram-size--compute-needs-a-second-fix). |
 | `Scripts\Remove-ForeignOemInfs.ps1` | Drops the OEM display INFs that cannot match this machine, taking the catalog rebuild from ~50 min to ~7. Opt-in via `-PruneForeignOemInfs`. See [Making a run finish in minutes](#making-a-run-finish-in-minutes-instead-of-an-hour). |
@@ -111,7 +111,7 @@ script that regenerates the `.ico` and `.png` from it.
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
 | `Scripts\whitelist.json` | The device/subsystem whitelist data the patcher applies. |
 | `Scripts\templates\GpuUnlockCert.nvi.template` | The verified-working installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. |
-| `Tests\PatchToolDiscovery.Tests.ps1` | Pester cases for the shared helpers: the section-index walk, device-line matching, `whitelist.json`-to-INF resolution, the certificate thumbprint reader, the driver-version parsing, and the unpack version guard. |
+| `Tests\PatchToolDiscovery.Tests.ps1` | Pester cases for the shared helpers: the section-index walk, device-line matching, `whitelist.json`-to-INF resolution, the certificate thumbprint reader, the driver-version parsing, the two NVIDIA pickers, and the unpack version guard. |
 | `Tests\InfPatchIntegrity.Tests.ps1` | End-to-end cases against a synthetic `Display.Driver` package: the gate refuses it unpatched, the patchers produce a package the gate certifies, insertions land inside the section bodies rather than in the blank gap after them, and a second pass changes nothing. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
@@ -541,7 +541,9 @@ Invoke-Pester Tests\InfPatchIntegrity.Tests.ps1    # just the end-to-end one
 walk that decides whether an inserted line lands with the section body or in the blank gap before
 the next header; device-line matching, including a trailing comment and a `&REV_` line that must not
 count as the same hardware ID; `whitelist.json`-to-INF filename resolution across the renames
-releases have used; reading a certificate thumbprint from a `.cer`; and the unpack version guard.
+releases have used; reading a certificate thumbprint from a `.cer`; and the unpack version guard,
+including the two picks that decide which folder on disk becomes the package: the `setup.exe` of
+the requested version, and the expansion folder whose path names it.
 
 `InfPatchIntegrity.Tests.ps1` builds a small but structurally faithful `Display.Driver` folder in a
 temp directory - two `[NVIDIA_Devices*]` blocks, two `[nv_miscBase_addreg__NN]` sections whose

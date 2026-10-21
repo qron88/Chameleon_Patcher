@@ -18,12 +18,15 @@ and nowhere else; see [Version](README.md#version).
   package, runs the real patchers against it and the verification gate before and after, and
   asserts that the insertions land with the section bodies rather than in the blank gap after them,
   that the patched package passes the gate, that a second pass leaves the file byte-identical, and
-  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. 47
+  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. 56
   cases, in Pester 3.4 syntax so they run on PowerShell 5.1 and 7 alike. They paid for themselves
   the day they were written: the section-index helper had been declared with a `[string[]]`
   parameter, and PowerShell refuses to bind an array containing an empty string to one - which
   describes every real INF file, so all three writers would have thrown on the first blank line of
   any real package. The tests caught it before it shipped.
+  They also pin the two picks that decide which folder on disk becomes the package. Those were
+  added after re-reading the committed stack: the picks chose between folders on disk with less
+  information than they needed to, and the entries under Fixed below are the consequence.
 - **The installer checkbox refuses the wrong certificate.** `Add-SetupCertOption.ps1` takes
   `-ExpectThumbprint`, defaulting to the certificate that actually signs the package's `.cat`
   files, and throws if the `.cer` it is about to bind differs. Left ticked, that checkbox trusts
@@ -44,9 +47,12 @@ and nowhere else; see [Version](README.md#version).
 - The whitelist patcher, the RM override and the verification gate now share one section header
   pattern and one section-index walk instead of each carrying its own header regex, so they cannot
   disagree about where an inserted line goes or about where a section ends.
-- `Unpack-DriverExe.ps1` picks the newest expansion by driver *version* rather than by name or
-  write time, and `Find-NvidiaSetupExe` prefers a setup.exe whose version matches the download
-  being unpacked.
+- `Unpack-DriverExe.ps1` asks for the version it was given at both points where it picks from
+  several folders on disk: the `setup.exe` to run, and the expansion folder to treat as the package.
+  In both places the version is a preference (the paths that name it come first) with the previous
+  order as the fallback, because not every route carries a version in its path; what was unpacked is
+  then verified against the requested version. Version order, not name order, also decides between
+  candidates: with three-part build numbers now in use, text order puts 617.142 ahead of 617.42.
 
 ### Fixed
 
@@ -59,6 +65,30 @@ and nowhere else; see [Version](README.md#version).
   for the driver you actually asked for is simply not there. The expansion is now checked against
   the requested version and the run stops with an explanation (and a warning when neither side
   names a version).
+- **The version guard stopped runs that had the right driver.** It compared the two versions as
+  texts, and a driver branch is routinely spelled two ways - the download says `617.42`, the
+  expansion folder NVIDIA wrote says `617.42.0.0`. `[version]` reports that pair as different too,
+  because the parts it did not see are undefined (`-1`) rather than zero, so the comparison needed
+  normalizing on both sides, which `Get-NormalizedDriverVersion` now does. A guard that stops good
+  runs is a guard people turn off, and this one stops a run whose package it was about to sign.
+- **The fallback route could disappear mid-run.** `Find-NvidiaSetupExe` treated the requested
+  version as a filter rather than a preference, so on a machine whose only `setup.exe` sat under
+  the `NVIDIA Display Operation Server` temp folder - a path that carries no version at all - every
+  candidate was discarded and the installer route returned nothing. That showed up as "-CheckPatchTools
+  says the tools are fine" followed by "neither a 7z-compatible tool nor an NVIDIA installer was
+  found" later in the same run. The version now only orders the candidates; the version of what was
+  actually unpacked is what the guard checks.
+- **`Find-NewestExpansion` picked on write time alone.** It is the pick that decides which folder
+  under `C:\NVIDIA` becomes the package that gets patched and signed, and a timestamp says "written
+  most recently", not "written by this run": copying a folder, an antivirus scan or a second
+  installer run for another version moves one. It now prefers a candidate whose path names the
+  requested version, which NVIDIA writes into the path for exactly this reason, and falls back to
+  the timestamp where no path names a version. The version check above stays, because on the temp
+  route there is no path to read the version from.
+- **A continued line was missed when the backslash was followed by spaces.** The continuation check
+  tested whether the raw line ends with a backslash; INF tolerates spaces after it and `Get-Content
+  ` keeps them, so the exact split the check exists to find went unreported. It now treats the
+  backslash as the last non-blank character of the line.
 
 ## [1.0.4] - 2026-10-12
 
