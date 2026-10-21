@@ -34,13 +34,15 @@
     Test-WhitelistCoversLocalGpu - whether any GPU in this machine is one whitelist.json
                                actually unlocks, which is what a pruned build depends on
     Write-InfLines           - rewrite an INF (or any text file) preserving its original
+                               UTF-8 BOM state, so a patch never changes the file's encoding
     Get-InfSectionIndex       - safe insertion point at the end of a section body, so a spliced
                                 line never lands outside the section it belongs to
     Test-InfLineContinuations - report backslash continuations inside the sections we patch, which
                                 the per-line matchers cannot see
     Get-DriverVersionTextFromPath / Get-PathVersionForSort - the driver version a path names, and a
-                                [version] to order NVIDIA paths by it instead of by text
-                               UTF-8 BOM state, so a patch never changes the file's encoding
+                               [version] to order NVIDIA paths by it instead of by text
+    Get-NormalizedDriverVersion - two version texts compared as versions, so 617.42 and 617.42.0.0
+                               are the same driver rather than two different ones
 
   Resolution is memoized for the lifetime of the dot-sourcing script and re-validated with
   Test-Path on each hit, so an SDK that is updated or removed mid-run cannot leave a stale
@@ -129,24 +131,32 @@ function Find-NvidiaSetupExe {
       Returns $null when neither exists. That is not an error here: it means the fallback is
       unavailable on this machine, and the caller decides what to do about it.
 
-      -ExpectedVersion is a filter, not a hint: NVIDIA's installer expands into its own fixed roots
-      and Unpack-DriverExe.ps1 then picks the expansion that appeared most recently, so a cached
-      folder from some other driver version sitting under C:\NVIDIA\DisplayDriver is not
-      distinguishable from "the payload of the download this run was asked to patch" by timestamp
-      alone. Asking for the setup.exe of the version actually requested is what keeps the two apart.
-      The candidate order is also by version rather than by name: text order puts 617.142 ahead of
-      617.42 now that three-part build numbers exist.
+      -ExpectedVersion prefers the setup.exe of the version this run was asked to patch: NVIDIA's
+      installer expands into its own fixed roots and Unpack-DriverExe.ps1 picks the expansion that
+      appeared most recently, so a cached folder of some other driver version under
+      C:\NVIDIA\DisplayDriver is not distinguishable from "the payload of the download this run was
+      asked to patch" by timestamp alone. Asking for the version actually requested is what keeps
+      the two apart; it does not discard the rest, because the version check on the unpacked result
+      is the real guard. The candidate order is by version rather than by name: text order puts
+      617.142 ahead of 617.42 now that three-part build numbers exist.
     #>
-    param([string]$ExpectedVersion)
+    param([string]$ExpectedVersion, [string[]]$Roots)
 
-    $candidates = @(
+    # NVIDIA's two fixed expansion roots. -Roots exists only so the picker can be tested against a
+    # scratch tree; every real caller gets these two.
+    $candidates = if ($Roots) { @($Roots) } else { @(
         'C:\NVIDIA\DisplayDriver',
         (Join-Path $env:TEMP 'NVIDIA Display Operation Server')
-    )
+    ) }
     foreach ($root in $candidates) {
         if (-not $root -or -not (Test-Path $root)) { continue }
-        $hit = Get-ChildItem -Path $root -Filter 'setup.exe' -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { (-not $ExpectedVersion) -or $_.FullName -like "*$ExpectedVersion\*" } |
+        $found = @(Get-ChildItem -Path $root -Filter 'setup.exe' -Recurse -File -ErrorAction SilentlyContinue)
+        # A preference, not a filter: the %TEMP% route below carries no version in its path at all,
+        # so requiring one would delete the fallback on a machine that has nothing else. The version
+        # of what was actually unpacked is checked in Unpack-DriverExe.ps1 either way.
+        $pick = if ($ExpectedVersion) { @($found | Where-Object { $_.FullName -like "*$ExpectedVersion\*" }) } else { $found }
+        if ($pick.Count -eq 0) { $pick = $found }
+        $hit = $pick |
             Sort-Object @{Expression = { Get-PathVersionForSort -Path $_.FullName }; Descending = $true },
                         @{Expression = { $_.FullName }; Descending = $true } |
             Select-Object -First 1
@@ -385,7 +395,11 @@ function Test-InfLineContinuations {
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         $headerMatch = $script:InfSectionHeaderRx.Match([string]$Lines[$i])
         if ($headerMatch.Success) { $section = $headerMatch.Groups[1].Value.Trim(); continue }
-        if (-not ([string]$Lines[$i]).EndsWith('\')) { continue }
+        $text = [string]$Lines[$i]
+        # The backslash has to be the last non-blank character of the line: INF tolerates spaces
+        # after it and Get-Content keeps them, so a plain EndsWith check would miss exactly the kind
+        # of split this check exists to find.
+        if ($text -notmatch '\\\s*$') { continue }
         if ($section -and $section -match '^(?i:NVIDIA_Devices|nv_miscBase_addreg__|Strings($|\.))') { $flagged += ($i + 1) }
     }
     if ($flagged.Count -eq 0) { return 0 }
@@ -433,6 +447,21 @@ function Get-PathVersionForSort {
     $text = Get-DriverVersionTextFromPath -Path $Path -Deepest
     if (-not $text) { return [version]'0.0' }
     try { return [version]$text } catch { return [version]'0.0' }
+}
+
+function Get-NormalizedDriverVersion {
+    <#
+      Two version texts compared as versions rather than as text. 617.42 and 617.42.0.0 name the
+      same driver, but [version] does NOT read the missing parts as zero - [version]'617.42' has
+      Build = -1 - so comparing the [version] objects alone reports a match as a mismatch. Returns
+      the four-part text with the undefined parts as zeros, or $null when the text is not a version
+      at all. Unpack-DriverExe.ps1 uses it to decide whether an expansion really is the version that
+      was asked for, which is the difference between stopping a bad run and stopping a good one.
+    #>
+    param([string]$Text)
+    $v = [version]'0.0'
+    if (-not [version]::TryParse($Text, [ref]$v)) { return $null }
+    return ('{0}.{1}.{2}.{3}' -f $v.Major, $v.Minor, [Math]::Max($v.Build, 0), [Math]::Max($v.Revision, 0))
 }
 
 function Get-LocalNvidiaGpu {
