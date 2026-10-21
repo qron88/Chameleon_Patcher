@@ -48,7 +48,30 @@ function Remove-ScratchDir {
     if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+function New-InstallerUnder {
+    param([string]$Root, [string]$Version)
+    $dir = Join-Path $Root (Join-Path $Version 'Win10_64\Current')
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $file = Join-Path $dir 'setup.exe'
+    Set-Content -LiteralPath $file -Value 'not really an installer'
+    return $file
+}
+
+function New-ExpansionUnder {
+    # Creates the layout NVIDIA uses - DisplayDriver\<version>\<os>\Current\setup.cfg - and sets the
+    # marker file timestamp, because the whole question these tests ask is "what did the pick choose
+    # on: the timestamp, or the version in the path?".
+    param([string]$Root, [string]$Version, [double]$AgeHours = 0, [double]$AgeMinutes = 0)
+    $dir = Join-Path $Root (Join-Path (Join-Path 'DisplayDriver' $Version) 'Win10_64\Current')
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $file = Join-Path $dir 'setup.cfg'
+    Set-Content -LiteralPath $file -Value 'not really a setup.cfg'
+    (Get-Item -LiteralPath $file).LastWriteTime = (Get-Date).AddHours(-$AgeHours).AddMinutes(-$AgeMinutes)
+    return (Split-Path $dir -Parent)
+}
+
 . $ImportFunctionFromScript -Path (Join-Path $ScriptsDir 'Unpack-DriverExe.ps1') -Name 'Assert-ExpandedVersionMatchesRequest'
+. $ImportFunctionFromScript -Path (Join-Path $ScriptsDir 'Unpack-DriverExe.ps1') -Name 'Find-NewestExpansion'
 
 Describe 'Get-InfSectionIndex' {
     # EndIndex from the section scanners is an UPPER BOUND (end of file for the last section), so the
@@ -102,6 +125,14 @@ Describe 'Test-InfLineContinuations' {
         $lines = @('[Version]', 'Class=Display', '[NVIDIA_Devices.NTamd64.10.0]', '%X% = Section001, PCI\VEN_10DE&DEV_1234')
         Test-InfLineContinuations -Path 'nv_dispi.inf' -Lines $lines | Should Be 0
     }
+    It 'flags a continuation whose backslash is followed by spaces, which real INFs do use' {
+        # Get-Content keeps those trailing spaces, so testing the raw line with EndsWith let exactly
+        # the kind of split this check exists to find through.
+        $lines = @('[NVIDIA_Devices.NTamd64.10.0]',
+                   '%NVIDIA_DEV.1E90% = Section001, \   ',
+                   '    PCI\VEN_10DE&DEV_1E90&SUBSYS_112210DE')
+        Test-InfLineContinuations -Path 'nv_dispi.inf' -Lines $lines | Should Be 1
+    }
 }
 
 Describe 'driver version helpers' {
@@ -134,6 +165,15 @@ Describe 'driver version helpers' {
     }
     It 'sorts paths with no version in them last, never above a real version' {
         Get-PathVersionForSort -Path 'C:\NVIDIA\DisplayDriver\Win10_64\Current\setup.exe' | Should Be ([version]'0.0')
+    }
+    It 'normalizes version texts so 617.42 and 617.42.0.0 are one driver, not two' {
+        # [version] leaves the missing parts undefined (-1), so comparing the [version] objects alone
+        # calls this pair different. Get-NormalizedDriverVersion fills them with zeros.
+        Get-NormalizedDriverVersion '617.42' | Should Be '617.42.0.0'
+        Get-NormalizedDriverVersion '617.42.0.0' | Should Be '617.42.0.0'
+        Get-NormalizedDriverVersion '552.22.0.4' | Should Be '552.22.0.4'
+        Get-NormalizedDriverVersion '616.86.1' | Should Not Be (Get-NormalizedDriverVersion '616.86')
+        Get-NormalizedDriverVersion 'laptop-driver' | Should BeNullOrEmpty
     }
 }
 
@@ -269,5 +309,80 @@ Describe 'Assert-ExpandedVersionMatchesRequest' {
             -RequestedExePath 'C:\Downloads\driver-latest.exe' } 3>&1)
         (@($warnings).Count) | Should Be 1
         "$(@($warnings)[0])" | Should Match 'does not name a driver version'
+    }
+    It 'accepts an expansion folder that writes the same branch with trailing zeros' {
+        # 617.42 on the download and 617.42.0.0 on disk name the same driver. Comparing the two as
+        # texts stopped a run that was about to patch the right package - a safety net that stops
+        # good runs is a safety net people turn off.
+        $warnings = @(& { Assert-ExpandedVersionMatchesRequest -ExpandedRoot 'C:\NVIDIA\DisplayDriver\617.42.0.0\Win10_64\Current' -RequestedExePath 'C:\Downloads\617.42-desktop-win10-win11-64bit-international-dch-whql.exe' } 3>&1)
+        (@($warnings).Count) | Should Be 0
+    }
+}
+
+Describe 'Find-NvidiaSetupExe' {
+    # -Roots stands in for C:\NVIDIA\DisplayDriver and the SFX temp folder, so these tests never
+    # depend on - never touch - what happens to be on this machine.
+    It 'prefers the installer of the version this run was asked for, even when a newer one exists' {
+        $root = New-ScratchDir 'setupexe'
+        try {
+            New-InstallerUnder -Root $root -Version '617.42' | Out-Null
+            $wanted = New-InstallerUnder -Root $root -Version '616.86'
+            Find-NvidiaSetupExe -ExpectedVersion '616.86' -Roots @($root) | Should Be $wanted
+        }
+        finally { Remove-ScratchDir $root }
+    }
+    It 'keeps an installer whose path names no version, because that is what the temp route looks like' {
+        # The bug this covers: with the version as a hard filter, every candidate under
+        # %TEMP%\NVIDIA Display Operation Server was discarded (that route carries no version in its
+        # path), so the fallback disappeared on a machine with no 7-Zip and nothing else.
+        $root = New-ScratchDir 'setupexe'
+        try {
+            $only = New-InstallerUnder -Root $root -Version 'noversion'
+            $hit = Find-NvidiaSetupExe -ExpectedVersion '617.42' -Roots @($root)
+            $hit | Should Not BeNullOrEmpty
+            $hit | Should Be $only
+        }
+        finally { Remove-ScratchDir $root }
+    }
+    It 'returns nothing when no root holds an installer at all' {
+        $root = New-ScratchDir 'setupexe'
+        try {
+            Find-NvidiaSetupExe -ExpectedVersion '617.42' -Roots @($root, (Join-Path $root 'missing')) | Should BeNullOrEmpty
+        }
+        finally { Remove-ScratchDir $root }
+    }
+}
+
+Describe 'Find-NewestExpansion' {
+    # setup.cfg is the marker the installer route waits for, and the pick is what decides WHICH
+    # expansion becomes the package that gets patched and signed. A timestamp says "written most
+    # recently"; it does not say "written by this run".
+    It 'prefers the expansion whose folder names the requested version over a newer timestamp' {
+        $root = New-ScratchDir 'expansion'
+        try {
+            $asked = New-ExpansionUnder -Root $root -Version '616.86' -AgeHours 5
+            New-ExpansionUnder -Root $root -Version '617.42' -AgeMinutes 1 | Out-Null
+            Find-NewestExpansion -Before @{} -ExpectedVersion '616.86' -Roots @($root) | Should Be $asked
+        }
+        finally { Remove-ScratchDir $root }
+    }
+    It 'falls back to the newest timestamp when no candidate names a version' {
+        $root = New-ScratchDir 'expansion'
+        try {
+            New-ExpansionUnder -Root $root -Version 'noversion' -AgeHours 5 | Out-Null
+            $newer = New-ExpansionUnder -Root $root -Version 'nosversion' -AgeMinutes 1
+            Find-NewestExpansion -Before @{} -Roots @($root) | Should Be $newer
+        }
+        finally { Remove-ScratchDir $root }
+    }
+    It 'still ignores a setup.cfg that was already there and untouched' {
+        $root = New-ScratchDir 'expansion'
+        try {
+            $cached = New-ExpansionUnder -Root $root -Version '616.86' -AgeMinutes 1
+            $marker = Join-Path $cached 'Current\setup.cfg'
+            $before = @{ $marker = (Get-Item -LiteralPath $marker).LastWriteTime.Ticks }
+            Find-NewestExpansion -Before $before -Roots @($root) | Should BeNullOrEmpty
+        }
+        finally { Remove-ScratchDir $root }
     }
 }
