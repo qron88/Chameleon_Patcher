@@ -141,6 +141,47 @@ function Expand-ByNvidiaInstaller {
     return $expandedRoot
 }
 
+function Assert-ExpandedVersionMatchesRequest {
+    <#
+      Guards the installer unpack route against a silent version substitution, which is the one
+      failure that route has and which nothing downstream catches.
+
+      NVIDIA's installer writes into its own fixed roots, and Find-NewestExpansion picks the newest
+      setup.cfg that appeared while the process ran. A driver version already sitting under
+      C:\NVIDIA\DisplayDriver\<version>\ whose timestamp moves for an unrelated reason - a copy, an
+      antivirus scan, a second installer run for a different version - is therefore not
+      distinguishable from the expansion this launch caused. Everything downstream is
+      version-agnostic: the whitelist splice, the RM override and the verification gate all pass
+      happily on the wrong driver version, and the package then gets signed, installed and reported
+      as if it were the one that was asked for.
+
+      NVIDIA's own expansion path names the version, so comparing it with the version in the
+      requested download's file name turns the silent case into a loud one. Where neither side names
+      a version this warns instead of throwing: it is a safety net, not a new hard requirement.
+    #>
+    param([string]$ExpandedRoot, [string]$RequestedExePath)
+    $requested = Get-DriverVersionTextFromPath -Path $RequestedExePath
+    $actual = Get-DriverVersionTextFromPath -Path $ExpandedRoot -Deepest
+    if (-not $requested) {
+        Write-Warning "The requested file name does not name a driver version, so the expansion could not be checked against it. Expansion used: $ExpandedRoot"
+        return
+    }
+    if (-not $actual) {
+        Write-Warning "NVIDIA's expansion folder $ExpandedRoot does not name a driver version, so it could not be checked against the requested version $requested. Check the package version before signing it."
+        return
+    }
+    if ($actual -ne $requested) {
+        throw @"
+NVIDIA's installer route produced an expansion of driver version $actual ($ExpandedRoot), but the requested download is driver version $requested : $RequestedExePath.
+
+The installer writes into its own fixed roots, and the newest expansion to appear on disk is not necessarily the payload of the download this run was asked to patch - C:\NVIDIA can hold expansions of other versions whose timestamps move for unrelated reasons. Everything downstream of this step (the whitelist splice, the RM override, the verification gate) is version-agnostic and would have signed a package of the wrong version without complaining.
+
+Use a 7-Zip compatible tool (7-Zip or NanaZip) so the requested file is extracted directly, or unpack the requested .exe yourself and pass -SourcePackagePath.
+"@
+    }
+    Write-Host "  Expanded package is driver version $actual, matching the requested download." -ForegroundColor DarkGreen
+}
+
 function Find-NewestExpansion {
     <#
       Newest setup.cfg under NVIDIA's expansion roots that was not present (or was not modified)
@@ -163,6 +204,10 @@ function Find-NewestExpansion {
 # --- Route selection --------------------------------------------------------------------------
 # 7z first: it is faster, extracts to the exact folder requested, and runs nothing. The
 # installer route is the fallback that keeps 7-Zip off the list of hard requirements.
+# The fallback picks an expansion by timestamp, which is why it also verifies the version it ended
+# up with - see Assert-ExpandedVersionMatchesRequest below, and the -ExpectedVersion filter it asks
+# discovery for. A cached C:\NVIDIA folder of another driver version is otherwise
+# indistinguishable from the payload of the download this run was asked to patch.
 $sevenZip = $null
 if ($SevenZipPath) {
     $sevenZip = Find-SevenZip -ExplicitPath $SevenZipPath
@@ -178,7 +223,7 @@ if (-not $sevenZip) {
         (Resolve-Path $SetupExePath).Path
     }
     else {
-        Find-NvidiaSetupExe
+        Find-NvidiaSetupExe -ExpectedVersion (Get-DriverVersionTextFromPath -Path $ExePath)
     }
 }
 
@@ -205,6 +250,8 @@ try {
         if (-not (Test-ExpandedPackageRoot $expanded)) {
             throw "NVIDIA expanded to $expanded, which does not look like a driver package root (expected setup.exe, setup.cfg, Display.Driver)."
         }
+        Assert-ExpandedVersionMatchesRequest -ExpandedRoot $expanded -RequestedExePath $ExePath
+
         Write-Host "Expanded to $expanded - copying into $OutputPath" -ForegroundColor DarkGray
         Copy-Item -Path (Join-Path $expanded '*') -Destination $OutputPath -Recurse -Force
     }
