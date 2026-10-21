@@ -68,9 +68,9 @@ Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
     $miscHeaderIdx = New-Object System.Collections.Generic.List[int]
     $allHeaderIdx = New-Object System.Collections.Generic.List[int]
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\[.+\]\s*$') {
+        if ($lines[$i] -match $script:InfSectionHeaderRx) {
             $allHeaderIdx.Add($i)
-            if ($lines[$i] -match '^\[nv_miscBase_addreg__\d+\]\s*$') {
+            if ($lines[$i] -match $script:InfMiscBaseAddRegRx) {
                 $miscHeaderIdx.Add($i)
             }
         }
@@ -91,8 +91,10 @@ Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
         }
         if ($bodyHasKey) { continue }
 
-        $insertAt = $endIdx
-        while ($insertAt -gt $hIdx + 1 -and $lines[$insertAt - 1].Trim() -eq '') { $insertAt-- }
+        # Walk back over the blank and comment tail of the section body so the new line lands with
+        # the rest of the section rather than in the gap before the next header - Get-InfSectionIndex
+        # is the shared form of this, also used by the whitelist patcher's [Strings] insert.
+        $insertAt = Get-InfSectionIndex -Lines $lines -HeaderIndex $hIdx -EndIndex $endIdx
         $lines.Insert($insertAt, $RmKeyLine)
         $patchedHere++
     }

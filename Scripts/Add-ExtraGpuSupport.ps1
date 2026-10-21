@@ -75,11 +75,11 @@ function Find-DeviceBlocks {
     # Returns list of @{StartIndex; EndIndex} for each [NVIDIA_Devices...] section (end = index of blank/next-header line, exclusive)
     $blocks = @()
     for ($i = 0; $i -lt $Lines.Count; $i++) {
-        if ($Lines[$i] -match '^\[NVIDIA_Devices[^\]]*\]\s*$') {
+        if ($Lines[$i] -match $script:InfDeviceBlockRx) {
             $start = $i + 1
             $end = $Lines.Count
             for ($j = $start; $j -lt $Lines.Count; $j++) {
-                if ($Lines[$j] -match '^\[.+\]\s*$') { $end = $j; break }
+                if ($Lines[$j] -match $script:InfSectionHeaderRx) { $end = $j; break }
             }
             $blocks += [PSCustomObject]@{ StartIndex = $start; EndIndex = $end }
         }
@@ -93,7 +93,7 @@ function Find-SectionBounds {
         if ($Lines[$i].Trim() -eq "[$SectionName]") {
             $end = $Lines.Count
             for ($j = $i + 1; $j -lt $Lines.Count; $j++) {
-                if ($Lines[$j] -match '^\[.+\]\s*$') { $end = $j; break }
+                if ($Lines[$j] -match $script:InfSectionHeaderRx) { $end = $j; break }
             }
             return [PSCustomObject]@{ HeaderIndex = $i; EndIndex = $end }
         }
@@ -107,7 +107,7 @@ function Get-StringsSectionBounds {
         if ($Lines[$i].Trim() -eq '[Strings]') {
             $end = $Lines.Count
             for ($j = $i + 1; $j -lt $Lines.Count; $j++) {
-                if ($Lines[$j] -match '^\[.+\]\s*$') { $end = $j; break }
+                if ($Lines[$j] -match $script:InfSectionHeaderRx) { $end = $j; break }
             }
             return [PSCustomObject]@{ HeaderIndex = $i; EndIndex = $end }
         }
@@ -224,7 +224,7 @@ function Patch-InfFile {
             if (-not $hasString) {
                 $desc = $entry.description
                 if (-not $desc) { $desc = "NVIDIA Graphics Device" }
-                $lines.Insert($stringsBounds.EndIndex, "$keyName = `"$desc`"")
+                $lines.Insert($(Get-InfSectionIndex -Lines $lines -HeaderIndex $stringsBounds.HeaderIndex -EndIndex $stringsBounds.EndIndex), "$keyName = `"$desc`"")
             }
         }
 

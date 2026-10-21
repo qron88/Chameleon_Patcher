@@ -100,8 +100,14 @@ function Get-InfSections {
     $sections = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([StringComparer]::OrdinalIgnoreCase)
     $current = $null
     foreach ($line in $Lines) {
-        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
-            $current = $Matches[1].Trim()
+        # One shared header pattern with the patchers ($script:InfSectionHeaderRx, from
+        # PatchToolDiscovery.ps1): the gate allowed leading whitespace and a "]" inside the header
+        # text where the patchers did not, and a header the two sides disagree about is a section
+        # one of them silently never looked at. Match object rather than $Matches, so the pattern
+        # can live as a shared [regex] constant.
+        $headerMatch = $script:InfSectionHeaderRx.Match($line)
+        if ($headerMatch.Success) {
+            $current = $headerMatch.Groups[1].Value.Trim()
             if (-not $sections.ContainsKey($current)) {
                 $sections[$current] = New-Object System.Collections.Generic.List[string]
             }
@@ -193,6 +199,11 @@ foreach ($t in $targets) {
     if (-not $t.Exact) { $aka = " (this release's name for $($t.Key))" }
 
     $lines = Get-Content -Path $infPath -Encoding UTF8
+    # A device entry, [Strings] definition or RM override split across physical lines with a
+    # trailing backslash is invisible to every per-line matcher below, which would then certify an
+    # INF it only partly read. Report it rather than pass over it.
+    Test-InfLineContinuations -Path $infPath -Lines $lines
+
     $sections = Get-InfSections -Lines $lines
 
     # Every [NVIDIA_Devices*] block is checked on its own. Each serves a different OS target, so an
