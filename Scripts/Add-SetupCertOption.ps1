@@ -43,6 +43,11 @@
 
 .PARAMETER CerPath
   Certificate to embed (the same one used to sign nv_disp.cat for this package).
+.PARAMETER ExpectThumbprint
+  Thumbprint of the certificate that signed this package's catalog. Left unset, the script reads it
+  from the nv_disp*.cat inside the package and requires -CerPath to match it, because everything
+  downstream installs this certificate into the machine-wide Root store. Set it only to say
+  deliberately that the catalog was re-signed with a different certificate.
 
 .EXAMPLE
   .\Add-SetupCertOption.ps1 -PackageRoot "D:\NVIDIA\610.xx_Patched" -CerPath "..\Certificates\DriverPatchSigning_<thumbprint>.cer"
@@ -54,6 +59,12 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$CerPath,
+
+    # Which certificate this one has to be. Defaults to the certificate that signed this package's
+    # nv_disp*.cat, the only certificate with a claim on the driver being installed; pass it
+    # explicitly only to override that on purpose.
+    [ValidatePattern('^[0-9A-Fa-f]{40}$')]
+    [string]$ExpectThumbprint,
 
     # disposition="default" pre-ticks the row; "optional" leaves it unticked. Either way the user
     # can toggle it, unlike "critical" which locks it on.
@@ -69,9 +80,54 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
+
 $setupCfgPath = Join-Path $PackageRoot "setup.cfg"
 if (-not (Test-Path $setupCfgPath)) { throw "setup.cfg not found under $PackageRoot" }
 if (-not (Test-Path $CerPath)) { throw "Certificate not found: $CerPath" }
+# --- Bind the certificate to the package's own signature -----------------------------------------
+# This option ends with the certificate in LocalMachine\Root and TrustedPublisher, which decides
+# what ALL software on the machine accepts afterwards, not just this driver. If the .cer handed in
+# here is not the certificate nv_disp*.cat is signed with, the run trusts a certificate that has no
+# connection to the driver being installed - and Test Signing accepts the result either way, so
+# nothing downstream ever complains. The package itself already states who signed it, so read that
+# and refuse on a mismatch instead of trusting whatever .cer happened to be on the command line.
+$displayDriver = Join-Path $PackageRoot "Display.Driver"
+$catalogs = @(Get-ChildItem -Path $displayDriver -Filter "nv_disp*.cat" -File -ErrorAction SilentlyContinue)
+if ($catalogs.Count -eq 0) {
+    Write-Warning "No nv_disp*.cat under $displayDriver, so the certificate cannot be checked against this package's signature. Embedding $(Split-Path $CerPath -Leaf) unverified; the catalogs are normally signed before this step."
+}
+else {
+    $signers = @()
+    foreach ($cat in $catalogs) {
+        $signer = (Get-AuthenticodeSignature -LiteralPath $cat.FullName).SignerCertificate
+        if ($signer) { $signers += $signer.Thumbprint }
+    }
+    $signers = @($signers | Select-Object -Unique)
+    if ($signers.Count -eq 0) {
+        throw "None of the $($catalogs.Count) catalog(s) under $displayDriver is signed, so the package states no certificate to bind $(Split-Path $CerPath -Leaf) to. Sign the catalogs (Inf2Cat, then signtool) before embedding a certificate in the installer."
+    }
+    if ($signers.Count -gt 1) {
+        throw "The package catalogs disagree about who signed them ($($signers -join ", ")). Embedding one certificate would bless a package that is not internally consistent - re-run the signing step for this package."
+    }
+    $expected = if ($ExpectThumbprint) { $ExpectThumbprint.ToUpperInvariant() } else { $signers[0] }
+    $actual = Get-CerThumbprint -Path $CerPath
+    if (-not $actual) {
+        throw "$(Split-Path $CerPath -Leaf) does not contain a readable certificate, so it cannot be checked against the catalog signature (expected thumbprint $expected). Pass the .cer that matches the certificate which signed this package's catalog."
+    }
+    if ($actual -ne $expected) {
+        throw @"
+The certificate to embed is not the certificate that signed this package.
+
+  certificate to embed : $(Split-Path $CerPath -Leaf) = $actual
+  signed the catalogs  : $expected
+
+Embedding it would add a certificate to the machine's Root and TrustedPublisher stores that has nothing to do with the driver being installed, and Test Signing would let the pair load anyway. Use the .cer matching $expected, or pass -ExpectThumbprint $actual to say the catalogs were re-signed deliberately.
+"@
+    }
+    Write-Host "  Certificate matches the package catalog signature ($actual)." -ForegroundColor DarkGreen
+}
+
 
 $componentDir = Join-Path $PackageRoot "GpuUnlockCert"
 
