@@ -34,6 +34,12 @@
     Test-WhitelistCoversLocalGpu - whether any GPU in this machine is one whitelist.json
                                actually unlocks, which is what a pruned build depends on
     Write-InfLines           - rewrite an INF (or any text file) preserving its original
+    Get-InfSectionIndex       - safe insertion point at the end of a section body, so a spliced
+                                line never lands outside the section it belongs to
+    Test-InfLineContinuations - report backslash continuations inside the sections we patch, which
+                                the per-line matchers cannot see
+    Get-DriverVersionTextFromPath / Get-PathVersionForSort - the driver version a path names, and a
+                                [version] to order NVIDIA paths by it instead of by text
                                UTF-8 BOM state, so a patch never changes the file's encoding
 
   Resolution is memoized for the lifetime of the dot-sourcing script and re-validated with
@@ -122,7 +128,17 @@ function Find-NvidiaSetupExe {
                                                                        run the download normally
       Returns $null when neither exists. That is not an error here: it means the fallback is
       unavailable on this machine, and the caller decides what to do about it.
+
+      -ExpectedVersion is a filter, not a hint: NVIDIA's installer expands into its own fixed roots
+      and Unpack-DriverExe.ps1 then picks the expansion that appeared most recently, so a cached
+      folder from some other driver version sitting under C:\NVIDIA\DisplayDriver is not
+      distinguishable from "the payload of the download this run was asked to patch" by timestamp
+      alone. Asking for the setup.exe of the version actually requested is what keeps the two apart.
+      The candidate order is also by version rather than by name: text order puts 617.142 ahead of
+      617.42 now that three-part build numbers exist.
     #>
+    param([string]$ExpectedVersion)
+
     $candidates = @(
         'C:\NVIDIA\DisplayDriver',
         (Join-Path $env:TEMP 'NVIDIA Display Operation Server')
@@ -130,7 +146,9 @@ function Find-NvidiaSetupExe {
     foreach ($root in $candidates) {
         if (-not $root -or -not (Test-Path $root)) { continue }
         $hit = Get-ChildItem -Path $root -Filter 'setup.exe' -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
+            Where-Object { (-not $ExpectedVersion) -or $_.FullName -like "*$ExpectedVersion\*" } |
+            Sort-Object @{Expression = { Get-PathVersionForSort -Path $_.FullName }; Descending = $true },
+                        @{Expression = { $_.FullName }; Descending = $true } |
             Select-Object -First 1
         if ($hit) { return $hit.FullName }
     }
@@ -303,6 +321,118 @@ function Assert-PatchTools {
     $resolved['Inf2Cat']  = $inf2cat
     $resolved['SignTool'] = $signtool
     return $resolved
+}
+
+# --- Shared INF layout helpers -------------------------------------------------------------------
+# Each INF header pattern used to be written out separately in the patchers and in the verification
+# gate: the whitelist patcher required a header at column 0 while the gate allowed leading
+# whitespace, and the RM-override patcher allowed a "]" inside the header text. A header one side
+# failed to recognise is a section that side silently never looked at - so the gate could certify a
+# layout the patchers never understood, or a patcher could mistake a section boundary and splice a
+# line into the wrong place. Keep every header test on these constants instead.
+$script:InfSectionHeaderRx = [regex]'^\s*\[([^\]]+)\]\s*$'
+$script:InfDeviceBlockRx = '^\s*\[NVIDIA_Devices[^\]]*\]\s*$'
+$script:InfMiscBaseAddRegRx = '^\s*\[nv_miscBase_addreg__\d+\]\s*$'
+
+function Get-InfSectionIndex {
+    <#
+      The index at which a body line can be appended to the section starting at HeaderIndex without
+      landing outside that section.
+
+      The scanners report EndIndex as an UPPER BOUND, not as a safe insertion point: for the last
+      section of a file it is the end of the file. Inserting there puts the new line in the blank
+      run after the section, where it belongs to no section at all - for a spliced [Strings]
+      definition that means the %Key% token on a device line still reads as undefined to the
+      verification gate, which reads the definitions out of the [Strings] body. Blank and comment
+      lines at the tail of a body are still inside the section, so walking back over them keeps the
+      line in place whatever follows it, including a section that ends the file.
+    #>
+    param(
+        # $Lines is deliberately untyped, like Find-InfDeviceLine's: a Mandatory [string[]] parameter
+        # refuses to bind an array whose ELEMENTS include an empty string, and an INF body is full of
+        # blank lines - confirmed on PowerShell 5.1 and 7.6. The patchers pass a List[string] here anyway.
+        [Parameter(Mandatory = $true)]$Lines,
+        [Parameter(Mandatory = $true)][int]$HeaderIndex,
+        [int]$EndIndex = -1
+    )
+    if ($EndIndex -lt 0 -or $EndIndex -gt $Lines.Count) { $EndIndex = $Lines.Count }
+    $at = $EndIndex
+    while ($at -gt $HeaderIndex + 1) {
+        $tail = ([string]$Lines[$at - 1]).Trim()
+        if ($tail -eq '' -or $tail.StartsWith(';')) { $at--; continue }
+        break
+    }
+    return $at
+}
+
+function Test-InfLineContinuations {
+    <#
+      Every INF matcher in this toolkit - the device-line matcher, the section scanners, the
+      RM-override presence test, the [Strings] definition scan - reads one physical line at a time.
+      INF also lets a logical line be split across physical lines with a trailing backslash, and a
+      split device entry stays invisible to the entry matcher while still resolving at install time;
+      a split RM1457588 line stays invisible to the presence test, and a split [Strings] definition
+      makes a key that IS defined look undefined. Folding continuations into the line buffers would
+      rewrite unrelated bytes of an already-patched package, so this reports them instead.
+
+      Scoped to the sections the matchers work on: driver INFs use backslash continuations freely
+      elsewhere (CopyFiles, AddReg lists), and warning about those would bury the one warning that
+      matters. Returns the number of continued lines found in the sections of interest.
+    #>
+    param([string]$Path, [string[]]$Lines)
+    $section = $null
+    $flagged = @()
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $headerMatch = $script:InfSectionHeaderRx.Match([string]$Lines[$i])
+        if ($headerMatch.Success) { $section = $headerMatch.Groups[1].Value.Trim(); continue }
+        if (-not ([string]$Lines[$i]).EndsWith('\')) { continue }
+        if ($section -and $section -match '^(?i:NVIDIA_Devices|nv_miscBase_addreg__|Strings($|\.))') { $flagged += ($i + 1) }
+    }
+    if ($flagged.Count -eq 0) { return 0 }
+    $shown = ($flagged | Select-Object -First 8) -join ', '
+    $more = ''
+    if ($flagged.Count -gt 8) { $more = " (+$($flagged.Count - 8) more)" }
+    Write-Warning "$(Split-Path $Path -Leaf): $($flagged.Count) continued line(s) (trailing backslash) inside the sections this toolkit patches, at line(s) $shown$more. The per-line matchers read one physical line at a time, so a continued device entry, [Strings] definition or RM override is invisible to them - check that none of those is split across lines before trusting this package."
+    return $flagged.Count
+}
+
+# --- Shared driver-version helpers ---------------------------------------------------------------
+# NVIDIA writes the driver version into two places a script can read: the download's own file name
+# (616.86-desktop-win10-win11-64bit-international-dch-whql.exe) and the folder its installer
+# expands into (C:\NVIDIA\DisplayDriver\617.42\Win10_64\Current). Comparing the two is what makes
+# the installer unpack route verifiable - see Assert-ExpandedVersionMatchesRequest in
+# Unpack-DriverExe.ps1. Three-part build numbers exist now (552.22.0.4), hence the optional tail.
+$script:DriverVersionSegmentRx = [regex]'(\d{3}\.\d{1,4}(?:\.\d{1,4}){0,2})'
+
+function Get-DriverVersionTextFromPath {
+    <#
+      The driver version a path refers to, as NVIDIA writes it, or $null when the path says nothing
+      about a version. -Deepest takes the LAST segment carrying one rather than the first, which is
+      what an expansion folder needs: a folder the user picked themselves can carry a version-looking
+      segment anywhere above the real one.
+    #>
+    param([string]$Path, [switch]$Deepest)
+    if (-not $Path) { return $null }
+    $found = $null
+    foreach ($seg in ($Path -split '[\\/]')) {
+        $m = $script:DriverVersionSegmentRx.Match($seg)
+        if (-not $m.Success) { continue }
+        if (-not $Deepest) { return $m.Groups[1].Value }
+        $found = $m.Groups[1].Value
+    }
+    return $found
+}
+
+function Get-PathVersionForSort {
+    <#
+      A [version] to order NVIDIA paths by driver version. Sorting those paths as TEXT is what puts
+      617.142 ahead of 617.42, and with three-part build numbers now published under C:\NVIDIA,
+      "newest by name" stopped meaning "newest by version".
+    #>
+    param([string]$Path)
+    $text = Get-DriverVersionTextFromPath -Path $Path -Deepest
+    if (-not $text) { return [version]'0.0' }
+    try { return [version]$text } catch { return [version]'0.0' }
 }
 
 function Get-LocalNvidiaGpu {
