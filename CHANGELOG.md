@@ -110,6 +110,15 @@ and nowhere else; see [Version](README.md#version).
   end-to-end run is recorded against 1.0.4 or later, that the `Logs\` its numbers come from are
   git-ignored and so absent from a clone, and that the test suite covers the INF handling but is not
   a substitute for a run on real hardware.
+- **Two couplings that were nobody's to read about are now written down.** The GUI identifies a
+  missing `.pfx` password by matching the literal phrase `none was supplied and prompting is
+  disabled` in the child's output and only then offers the `Import-PfxCertificate` line that fixes it
+  for good, so that phrase is an interface between `Chameleon-Patcher.cs` and the two scripts that
+  raise it: reword it and the hint disappears while the run still fails for the same reason. And
+  `Enable-OptionalComponents.ps1` only warns, then skips, when a whitelisted device line points at an
+  install section that does not exist, where `Test-DriverPatch.ps1` treats the same condition as
+  fatal - so the case still stops a run, just at the gate rather than at the step. Both are written
+  up as they already behave; neither is a code change.
 
 ## [1.0.4] - 2026-10-12
 
