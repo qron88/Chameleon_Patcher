@@ -146,6 +146,13 @@ would-be prompt into a clear error that appears in the log instead. In the norma
 case no password is involved at all. If you do type one, it travels in an environment variable
 set only on the child process (`$env:DRIVER_PATCH_PFX_PASSWORD`), never as a command-line argument.
 
+The GUI spots that particular error by looking for the phrase `none was supplied and prompting is
+disabled` in the child's output, and then offers the `Import-PfxCertificate` line that fixes it
+permanently. The phrase is therefore an interface between the C# and the two scripts that raise it
+(`Invoke-DriverPatchPipeline.ps1`, `Sign-DriverPackage.ps1`), not prose: reword the message and the
+hint silently stops appearing, with the run still failing for the same reason. All three live in
+this repository, so keep the wording in sync when editing either side.
+
 Ticking "Build for this PC only" on a machine whose GPU this patcher doesn't unlock gets a dialog
 before the run starts, offering the portable build instead - see [A pruned build needs a GPU worth
 pruning for](#a-pruned-build-needs-a-gpu-worth-pruning-for). Answering yes unticks the box, so the
@@ -206,8 +213,8 @@ The version is declared once, as assembly attributes at the top of `Source\Chame
 
 ```csharp
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.3.0")]
-[assembly: AssemblyInformationalVersion("1.0.3")]
+[assembly: AssemblyFileVersion("1.0.4.0")]
+[assembly: AssemblyInformationalVersion("1.0.4")]
 ```
 
 Everything else reads that one declaration back, so the number appears in three places and cannot
@@ -216,7 +223,7 @@ drift between them:
 **1. The window title bar**, which is the quickest check and makes a screenshot self-identifying:
 
 ```
-Chameleon Patcher 1.0.3
+Chameleon Patcher 1.0.4
 ```
 
 **2. The file's Win32 version resource.** `csc.exe` folds the attributes in by itself - there is no
@@ -232,13 +239,24 @@ literal, so a log and the binary that wrote it cannot disagree:
 ```
 === Chameleon Patcher - patch log ===
 started        : 2026-09-11 10:41:02 +02:00
-version        : 1.0.3
+version        : 1.0.4
 ```
 
 The log line matters because a patched driver package carries no trace of which build of this tool
 made it. Bumping a release means editing those three attributes and rebuilding; nothing else
 refers to the number. Keep `AssemblyVersion` at `x.y.0.0` and let the file and informational
 versions carry the precise one.
+
+One limit worth knowing, because it is the one way the number *can* mislead: the version lives in
+the compiled GUI, while everything the GUI actually runs is plain PowerShell read from `Scripts\`
+at start time. A run is therefore identified by the version **plus** the revision of `Scripts\`
+next to the `.exe`. A `.exe` sitting in a working tree whose scripts have moved on since the last
+release stamps an older number over newer behaviour, so a bug report quoting it can point at the
+wrong code. Before treating a version in a log as the whole truth, check it against
+[CHANGELOG.md](CHANGELOG.md): if the tree has an `Unreleased` section, the scripts were changed
+after that number was built. Cutting a release means a `CHANGELOG.md` heading with a date, the
+bumped attributes, a rebuild with `Source\Build.ps1`, and the rebuilt `.exe` committed in the same
+commit as the scripts it runs against.
 
 ### Patch logs
 
@@ -330,7 +348,8 @@ Unpacking a driver `.exe` has two routes, and `Unpack-DriverExe.ps1` picks betwe
 
 1. **A 7z-compatible CLI (NanaZip, 7-Zip)** — the preferred route. Extracts straight into the
    folder you name, in one step, running nothing. Found via the WindowsApps `7z.exe` alias, then
-   `Program Files\7-Zip`, then `Program Files\NanaZip`, then `PATH`.
+   `Program Files\7-Zip`, then `Program Files (x86)\7-Zip`, then `Program Files\NanaZip`, then
+   `PATH`.
 2. **NVIDIA's own installer, `setup.exe -x -s`** — the no-install fallback. Expands the package
    without installing a driver, so a machine with nothing third-party installed can still patch a
    download. It is slower, and it expands to NVIDIA's fixed location under the volume root
@@ -344,8 +363,8 @@ Point `-SourcePackagePath` at an already-unpacked folder and neither route runs 
 
 | Tool | Used by | How it's found |
 |---|---|---|
-| `Inf2Cat.exe` + `signtool.exe` (Windows SDK) | `Sign-DriverPackage.ps1` | `%WDKContentRoot%`, then `Windows Kits\10\bin` (newest version, x64 preferred), then `PATH`. **Required — no fallback.** |
-| A 7z-compatible CLI (NanaZip or 7-Zip) | `Unpack-DriverExe.ps1` | WindowsApps alias, `Program Files\7-Zip`, `Program Files\NanaZip`, then `PATH`. **Optional** — falls back to NVIDIA's installer. |
+| `Inf2Cat.exe` + `signtool.exe` (Windows SDK) | `Sign-DriverPackage.ps1` | `%WDKContentRoot%`, then `Program Files (x86)\Windows Kits\10\bin`, then `Program Files\Windows Kits\10\bin` (each newest version first, x64 preferred), then `PATH`. **Required — no fallback.** |
+| A 7z-compatible CLI (NanaZip or 7-Zip) | `Unpack-DriverExe.ps1` | WindowsApps alias, `Program Files\7-Zip`, `Program Files (x86)\7-Zip`, `Program Files\NanaZip`, then `PATH`. **Optional** — falls back to NVIDIA's installer. |
 | NVIDIA's `setup.exe` | `Unpack-DriverExe.ps1` (fallback route) | `C:\NVIDIA\DisplayDriver`, then the `NVIDIA Display Operation Server` temp folder. |
 | `certutil.exe` (built into Windows) | `Approve-DriverPatchCert.ps1`, and the `GpuUnlockCert.nvi` installer component | Always present on Windows |
 | `New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate` (PKI module, built-in) | `New-DriverSigningCert.ps1` | Ships with Windows, no install needed |
@@ -370,7 +389,8 @@ Point `-SourcePackagePath` at an already-unpacked folder and neither route runs 
 
 **Expect the catalog rebuild to dominate the runtime.** `Inf2Cat.exe` is a single-threaded 32-bit
 tool that re-validates the whole `Display.Driver` folder once per INF, and a real package has ~43
-INFs over ~2.7 GB, so the "Rebuilding + signing catalog" step (7 of 8 in a default run) can run
+INFs over ~2.7 GB, so the "Rebuilding + signing catalog" step (7 of 9 in a default run, and one
+lower each time you start from an already-unpacked folder or pass a `-Skip...` switch) can run
 for tens of minutes at 100% of one core while every other
 step finishes in seconds. Nothing is wrong when it appears to sit on `Processing INF:` for a long
 time.
@@ -392,7 +412,8 @@ Point it straight at a downloaded driver `.exe` — this is the normal case:
 One command: unpacks the installer (never touches the source `.exe`), applies the
 device/subsystem whitelist, applies the RM capability override, **verifies the patches actually
 applied**, reuses (or first generates) a signing cert, rebuilds and signs `nv_disp.cat`, and adds
-the opt-in installer checkbox. Output goes to a plain folder, `<basename>_Patched` next to the
+the "Chameleon GPU cert." installer checkbox, ticked by default (`-SkipSetupCertOption` leaves it
+out). Output goes to a plain folder, `<basename>_Patched` next to the
 source.
 
 Re-run exactly that same command for each NVIDIA driver release. You do **not** need to
@@ -473,13 +494,24 @@ enumerates, and the unlock simply isn't there - and nothing about the finished p
 `-PruneForeignOemInfs`), between patching and
 signing, and refuses to continue if anything is wrong. It re-reads the patched INFs and asserts:
 
-- Every INF named in `whitelist.json` is present and has at least one `[NVIDIA_Devices*]` block.
+- Every INF named in `whitelist.json` resolves to a file in the package - by exact name or through
+  the rename tiers below - and each resolved file has at least one `[NVIDIA_Devices*]` block.
 - Every whitelist entry's PCI device and subsystem ID is actually whitelisted, in every
   `[NVIDIA_Devices*]` block of the INF.
 - Each device line points at an install Section that **exists** in the same INF.
 - Every section a spliced-in `SectionExtraGPU*` body references resolves in that INF.
 - Every `%token%` a device line uses is defined in `[Strings]`.
 - Every `[nv_miscBase_addreg__NN]` section carries the `RM1457588` override.
+
+Everything on that list except the first half of the first bullet is a hard failure. A whitelist INF
+that has vanished under every name the tiers can reach is reported as a **warning** and the run
+still says `PASSED`, with its entries simply left out of the `N/N` count; that is deliberate,
+because a pruned build legitimately ships without it. It also means a universal build that lost
+`nv_dispi.inf` to a rename nothing can resolve will pass the gate and get signed, with the count
+dropped to `0/0` and the warning on stderr as its only trace. Read the gate's numbers, not just its
+colour. A file that **is** present but has no `[NVIDIA_Devices*]` block at all, and a package with
+no `nv_miscBase_addreg__*` section anywhere, are both hard failures, because either one means the
+INF layout is not what the patcher expects.
 
 Run it yourself against any package, patched or not:
 
@@ -580,7 +612,16 @@ taken from the run logs — not from a claim.
 
 The 617.14 and 617.42 rows are read straight out of `Logs\` and carry the gate's own verdict. The
 616.86 and 616.92 rows are reconstructed from the changelog and the measured timings — those runs
-predate the current log format, so their gate numbers are the reported ones, not a log line.
+predate the current log format, so their gate numbers are the reported ones, not a log line. Those
+logs are runtime files under `Logs\`, which is git-ignored, so they are not in the repository and
+cannot be checked from a clone.
+
+No end-to-end run is recorded against 1.0.4 or against the current working tree: the newest runs
+in the table above were made by 1.0.3, and everything added since then is in
+[CHANGELOG.md](CHANGELOG.md) under `Unreleased`. What covers that gap is the test suite in
+[Tests](#tests), which exercises the INF text handling and the gate end to end against a synthetic
+package - it is not a substitute for a real run on real hardware, and a driver release that is not
+listed above is still unverified in the sense that matters.
 
 What "verified" means here, concretely: the pipeline ran to completion, `Test-DriverPatch.ps1`
 passed its gate, and `signtool` signed the rebuilt catalog. **It does not mean the patched driver
@@ -784,8 +825,9 @@ hardware and not others.
 
 `Enable-OptionalComponents.ps1` levels this out for the GPUs this toolkit unlocks. It resolves
 each whitelisted device line to the install Section it points at and ensures that Section carries
-both flags. It runs as pipeline step 4 (5 with `-PruneForeignOemInfs`), before the catalog is built. Skip it with
-`-SkipOptionalComponents`.
+both flags. It runs as pipeline step 5 (6 with `-PruneForeignOemInfs`), before the catalog is
+built; the number drops by one for each `-Skip...` switch and for starting from an already
+unpacked folder. Skip it with `-SkipOptionalComponents`.
 
 It also flips one attribute in `setup.cfg`. `Display.NvApp` ships as
 `disposition="default" userSelectable="false"`, meaning pre-ticked and **locked**; the script sets
@@ -804,6 +846,12 @@ a template captured from an older one. Measured on 616.86, editing those affects
 ID, `DEV_24B6`, which shares `Section139` with a whitelisted RTX A3000 part and gains the App flag
 with it. The script prints how many device lines reference every section it touches, so a future
 release that shares sections more widely shows up rather than passing unnoticed.
+
+One asymmetry to know about: this step only **warns** when a whitelisted device line points at an
+install section that does not exist in the INF, and moves on (`skipping`). The gate treats the same
+condition as a hard failure, so the case still stops a run — just at the verification step rather
+than here. That is intentional: this step's job is to add flags where it safely can, and the gate is
+the thing that decides whether the package is sound.
 
 None of this is confirmed through a real install. Verify on your own hardware before relying on it.
 

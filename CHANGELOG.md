@@ -89,6 +89,27 @@ and nowhere else; see [Version](README.md#version).
   tested whether the raw line ends with a backslash; INF tolerates spaces after it and `Get-Content
   ` keeps them, so the exact split the check exists to find went unreported. It now treats the
   backslash as the last non-blank character of the line.
+- **The README drifted from the code it describes**, in a full read-through against the scripts
+  rather than from a bug report. Six things, none of them a code fault but all of them able to send
+  a reader or a bug report to the wrong place: the worked examples still showed `1.0.3` while the
+  attributes and the committed binary say `1.0.4`; two step-number references were off by one each
+  (the optional-components step is 5 of 9 in a default run, and the catalog rebuild is 7 of 9, not
+  7 of 8); the pipeline's own comments on pruning quoted a 399 s catalog rebuild against the 385 s
+  every measured table reports, so the comments were corrected to the measurement rather than the
+  reverse; the verification gate was described as asserting that every `whitelist.json` INF is
+  present, when a vanished INF is a warning that still lets the run pass at `0/0`; the 7z and SDK
+  discovery lists omitted the `Program Files (x86)` roots both actually check; and the installer
+  checkbox was called "opt-in" in one place and "ticked by default" in two others, which are not the
+  same setting. The gate paragraph now states which checks are hard failures and which are warnings,
+  and tells the reader to read the gate's `N/N` count rather than its colour.
+- **The README overclaimed what its own version number identifies.** It said the number "cannot
+  drift", but the number lives in the compiled GUI while everything it runs is read from `Scripts\`
+  at start time, so a binary left in a tree whose scripts moved on stamps an older number over newer
+  behaviour. The version section now says what a run is actually identified by - the version plus
+  the revision of `Scripts\` beside the `.exe` - and the verified-releases table says plainly that no
+  end-to-end run is recorded against 1.0.4 or later, that the `Logs\` its numbers come from are
+  git-ignored and so absent from a clone, and that the test suite covers the INF handling but is not
+  a substitute for a run on real hardware.
 
 ## [1.0.4] - 2026-10-12
 

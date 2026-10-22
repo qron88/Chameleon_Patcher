@@ -52,7 +52,7 @@
   Delete the OEM display INFs that cannot match this machine before doing anything else. A stock
   package ships 43; only the generic desktop INF and whatever matches your actual GPU can ever
   apply. Inf2Cat's cost is superlinear in INF count, so this is the only thing that meaningfully
-  shortens a run: measured on 616.86, the catalog rebuild went from about 3000 s to 399 s.
+  shortens a run: measured on 616.86, the catalog rebuild went from about 3000 s to 385 s.
 
   The resulting package is specific to the hardware in this machine and is NOT portable to other
   vendors' laptops, which is why it is opt-in. See Remove-ForeignOemInfs.ps1.
@@ -487,7 +487,7 @@ $prunedWhitelistInfs = @()
 if ($PruneForeignOemInfs) {
     # Runs FIRST, before any patching, so every later step has fewer INFs to walk: the whitelist
     # patch, the RM override, the verification gate and above all the catalog rebuild. Measured on
-    # 616.86, pruning 43 INFs down to 2 took the rebuild from ~3000 s to 399 s.
+    # 616.86, pruning 43 INFs down to 2 took the rebuild from ~3000 s to 385 s.
     $displayDriverDir = Join-Path $OutputPath "Display.Driver"
     $whitelistInfNames = @((Get-Content $WhitelistPath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
     $presentBeforePrune = @($whitelistInfNames | Where-Object {
