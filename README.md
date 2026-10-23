@@ -22,7 +22,10 @@ Two independent gates have to come off for an unlocked GPU to work, and the patc
 
 - **The INF-level PCI ID whitelist.** 61 device/subsystem-ID entries are added to the driver's
   INFs — 58 to `Display.Driver\nv_dispi.inf` (the main desktop INF) and 3 to `nvami.inf` (the
-  ASUS OEM INF). All additions, no removals. Most are **generic/OEM subsystem IDs**
+  ASUS OEM INF), counted against a release that ships both files under those names; on a release that
+  renames them the shared stem lookup stands in, and on one that does not ship an OEM INF at all the
+  entries filed under that key are an error the gate reports rather than a silent 3-entry gap. All
+  additions, no removals. Most are **generic/OEM subsystem IDs**
   (`SUBSYS_000010DE`, `SUBSYS_44494D50`, `SUBSYS_00000000`); a few are specific real OEM
   subsystem IDs (MSI/ASUS/Lenovo). This is what lets the driver install and the device enumerate.
 - **The driver's internal Resource-Manager check.** One registry override,
@@ -95,8 +98,9 @@ does it in seconds. A machine without one stops there and is told what to instal
 - **Windows PowerShell 5.1** (`powershell.exe`) — every `.ps1` here targets it specifically, not
   PowerShell 7+. Two of its quirks are worked around: `$PSScriptRoot` is empty inside a `param()`
   default when a script is launched via `-File`, and `Read-Host -AsSecureString` does not work over
-  a redirected stdin pipe. PS 7 is deliberately **not** a dependency (no PS 7-only syntax is used)
-  and the test suite runs on 5.1 and 7 alike.
+  a redirected stdin pipe. PS 7 is deliberately **not** a dependency (no PS 7-only syntax is used);
+  nothing in this repository currently exercises either interpreter, because there is no test suite in
+  the tree - see [Tests](#tests).
 - **.NET Framework 4.x** — `Chameleon-Patcher.exe` is a compiled WinForms app; the runtime is
   present on any normal Windows 10/11 install.
 - **`certutil.exe`** — used by `Approve-DriverPatchCert.ps1` and by the `GpuUnlockCert.nvi`
@@ -127,8 +131,13 @@ Windows already, so rebuilding needs no install either — see [GUI](#gui).
 - `Add-SetupCertOption.ps1` needs `templates\GpuUnlockCert.nvi.template`.
 - `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1` and the certificate generation all work
   on `Certificates\DriverPatchSigning_<thumbprint>.cer` (and `.pfx` when you asked for one), and all
-  three pick the certificate through one shared routine in `PatchToolDiscovery.ps1` so they cannot
-  disagree about which one it is. `Sign-DriverPackage.ps1` reads only the **public** `.cer` to learn
+  three read the certificate through `Get-SigningCerCandidates` / `Resolve-SigningCertificate` in
+  `PatchToolDiscovery.ps1`. That shared helper is what *finds* candidates; it does not make the three
+  agree - `Approve-DriverPatchCert.ps1` asks for the candidate route only (no store search) and
+  `Sign-DriverPackage.ps1` skips the store route whenever `-PfxPath` is supplied, so on the signing
+  machine they can end up naming different certificates. See
+  [Signing without a password](#signing-without-a-password) for the exact order each one uses.
+  `Sign-DriverPackage.ps1` reads only the **public** `.cer` to learn
   the thumbprint to sign with; the `.pfx` is touched on the fallback path only.
 - `Invoke-DriverPatchPipeline.ps1`, `Unpack-DriverExe.ps1` and `Sign-DriverPackage.ps1` dot-source
   `PatchToolDiscovery.ps1`.
@@ -211,10 +220,10 @@ script that regenerates the `.ico` and `.png` from it.
 | `Scripts\Sign-DriverPackage.ps1` | Rebuilds `nv_disp.cat` from the patched INFs (`Inf2Cat.exe`) and signs it (`signtool.exe`) with your cert. Signs **without any password** when the key is in your certificate store — see [Signing without a password](#signing-without-a-password). Which catalogs count as current is decided by comparing the `.cat` files in the folder with what was there before the rebuild: what Inf2Cat wrote or rewrote is signed, a catalog whose **same-stem INF** is still in the folder is signed with a warning that Inf2Cat did not regenerate it, and anything else is named and left unsigned rather than dressed up as current. That pairing is by filename, and catalog names actually come from the INF's `[Version] Catalog…` directives, not from the INF's filename - so check the signature of every `.cat` in `Display.Driver` after a run (see [Installing the patched driver](#installing-the-patched-driver)) rather than trusting the green summary. |
 | `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, `Inf2Cat.exe`, `signtool.exe`) and for the install guidance shown when one is missing, dot-sourced by the others. The pipeline resolves all three before copying anything, so a missing SDK or a missing 7-Zip fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. It also owns the INF text primitives every writer inserts through: `Get-InfSectionIndex` decides where a new line lands inside a section, the shared `[section]` header pattern keeps the patchers and the gate reading sections the same way, and `Test-InfLineContinuations` reports trailing-backslash continuations. `Test-DriverPackageRoot` is the one test both the unpack step and the pipeline use to decide whether a folder is a driver package. |
 | `Scripts\Add-SetupCertOption.ps1` | Adds a "Chameleon GPU cert." component to `setup.exe`'s Custom Installation Options screen, **ticked by default** and still user-selectable; `-Unchecked` makes it opt-in. Left ticked, it trusts the certificate in `Root` and `TrustedPublisher`, like `Approve-DriverPatchCert.ps1`. The label lives in `templates\GpuUnlockCert.nvi.template`, the same string in every locale. `-ExpectThumbprint` (default: the certificate that actually signs the package's `.cat` files) must match the `.cer` being bound, or the step throws. The checkbox hands whatever it is given to `Root` and `TrustedPublisher`, so this is what keeps an unrelated key out of the machine trust store. |
-| `Scripts\Approve-DriverPatchCert.ps1` | Standalone alternative to the installer checkbox: trusts the cert via a separate, explicit script you run yourself. Adds `Root` (makes the chain work) and `TrustedPublisher` (installs without a device-software prompt). By default it trusts the certificate the pipeline signs with. |
+| `Scripts\Approve-DriverPatchCert.ps1` | Standalone alternative to the installer checkbox: trusts the cert via a separate, explicit script you run yourself. Adds `Root` (makes the chain work) and `TrustedPublisher` (installs without a device-software prompt). With no `-CerPath` it takes the `.cer` whose private key is on this machine, else the newest `.cer` in `Certificates\` - which is the certificate the pipeline signs with only while that `.cer` is still on disk. It asserts nothing about the `.cer` it is given (no self-signed / EKU / subject test), so pass the file you minted, or use `Add-SetupCertOption.ps1`, which checks the `.cer` against the package's own signature. |
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
 | `Scripts\whitelist.json` | The device/subsystem whitelist data the patcher applies. |
-| `Scripts\templates\GpuUnlockCert.nvi.template` | The verified-working installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. |
+| `Scripts\templates\GpuUnlockCert.nvi.template` | The installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. Its rendering has been checked in the installer UI; the checked-through-a-full-install path has not - see [Trusting the certificate](#trusting-the-certificate). |
 | *nothing under `Tests\`* | The four Pester files described in [Tests](#tests) are **not in this repository**: they were lost before any of them was committed. The behaviour they cover is described there as a specification, and is currently checked by hand rather than by a runnable suite. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
@@ -607,9 +616,10 @@ not on the `%key%` name, because NVIDIA may already whitelist a given device ups
 release. In that case `Add-ExtraGpuSupport.ps1` skips it and the entry is present under NVIDIA's
 own line. What matters is that the combination is whitelisted, not who put it there.
 
-The patcher, the gate, the prune step and the optional-components step all use one parser and one
-matching rule (`Get-InfDeviceLine` / `Test-InfDeviceIdMatch` in `PatchToolDiscovery.ps1`), so they
-cannot disagree about whether an entry is there:
+The patcher, the gate, the prune step and the optional-components step all read device lines through
+one parser and one matching function (`Get-InfDeviceLine` / `Test-InfDeviceIdMatch` in
+`PatchToolDiscovery.ps1`), so they evaluate a given line the same way - but they do not share one
+model of the file, and where that difference shows is listed just below:
 
 - A trailing `; comment` is ignored.
 - For "is this whitelist entry present", the hardware ID must be exactly that DEV/SUBSYS. A stock
@@ -1212,8 +1222,11 @@ separately from the installer:
 
 Prints exactly what it's about to trust and asks for confirmation before running `certutil`. This
 is the path to prefer because you watch it happen and it is the one actually verified end to end.
-With no `-CerPath` it trusts the certificate the pipeline signs with: the `.cer` whose key is on
-this machine, or on a machine without the key, the newest `.cer` in `Certificates\`.
+With no `-CerPath` it takes the `.cer` whose private key is on this machine, or on a machine without
+the key, the newest `.cer` in `Certificates\` - which is the certificate the pipeline signs with
+whenever that `.cer` is the current one, and not guaranteed to be otherwise (see
+[Signing without a password](#signing-without-a-password)). `Add-SetupCertOption.ps1` is the stricter
+route: it refuses a `.cer` whose thumbprint does not match the one that signed the package's catalogs.
 
 **2. Manually**, if you'd rather see the raw commands:
 
