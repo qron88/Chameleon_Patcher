@@ -99,8 +99,8 @@ does it in seconds. A machine without one stops there and is told what to instal
   PowerShell 7+. Two of its quirks are worked around: `$PSScriptRoot` is empty inside a `param()`
   default when a script is launched via `-File`, and `Read-Host -AsSecureString` does not work over
   a redirected stdin pipe. PS 7 is deliberately **not** a dependency (no PS 7-only syntax is used);
-  nothing in this repository currently exercises either interpreter, because there is no test suite in
-  the tree - see [Tests](#tests).
+  the committed Pester files were written to run on 5.1 and 7 alike, but they are no longer in the
+  tree - see [Tests](#tests).
 - **.NET Framework 4.x** — `Chameleon-Patcher.exe` is a compiled WinForms app; the runtime is
   present on any normal Windows 10/11 install.
 - **`certutil.exe`** — used by `Approve-DriverPatchCert.ps1` and by the `GpuUnlockCert.nvi`
@@ -187,10 +187,18 @@ Chameleon_Project\
       (the legacy fixed name is still honoured as an input; it is no longer written)
 ```
 
-There is **no `Tests\` folder in this repository.** The four Pester files the [Tests](#tests)
-chapter describes were lost on the machine they were written on and never committed, so nothing
-under `Tests\` exists to run and `Invoke-Pester` finds nothing. Read that chapter as the
-specification of the suite, not as a description of this tree.
+`Tests\` is **not in the working tree** - commit `71ea1de` deleted it. Two files were ever committed,
+and git still holds their last revisions, so they are recoverable with one command:
+
+```powershell
+git show 0245335:Tests/PatchToolDiscovery.Tests.ps1   # 44 cases over 9 Describe blocks
+git show 0245335:Tests/InfPatchIntegrity.Tests.ps1    # 12 cases over 4 Describe blocks
+```
+
+Those two are the pre-1.0.5 revisions: 1.0.5 (`0245335`) did not touch them, and the deletion commit
+(`71ea1de`) removed them unchanged. The other two suites the [Tests](#tests) chapter describes were
+written and never committed, so nothing in git can restore them. Read that chapter as the description
+of the whole suite, and the commands above as what is actually reachable from this repository.
 
 `Certificates\` doesn't need to exist ahead of time - `New-DriverSigningCert.ps1` and
 `Invoke-DriverPatchPipeline.ps1` both create it automatically (as a sibling of `Scripts\`) the
@@ -224,7 +232,7 @@ script that regenerates the `.ico` and `.png` from it.
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
 | `Scripts\whitelist.json` | The device/subsystem whitelist data the patcher applies. |
 | `Scripts\templates\GpuUnlockCert.nvi.template` | The installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. Its rendering has been checked in the installer UI; the checked-through-a-full-install path has not - see [Trusting the certificate](#trusting-the-certificate). |
-| *nothing under `Tests\`* | The four Pester files described in [Tests](#tests) are **not in this repository**: they were lost before any of them was committed. The behaviour they cover is described there as a specification, and is currently checked by hand rather than by a runnable suite. |
+| *nothing under `Tests\`* | The Pester suites are gone from the tree (`71ea1de` deleted the folder). Only two files were ever committed - the shared-helper suite (44 cases) and the end-to-end INF fixture suite (12 cases) - and git still holds them at `0245335`, so they can be recovered. The other two suites described in [Tests](#tests) were never committed and are not in git at all. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
 Unpacking a downloaded `.exe` is done by a 7z-compatible CLI - this machine has NanaZip (a
@@ -664,13 +672,21 @@ up as a missing unlock afterwards.
 
 ## Tests
 
-**Status first: this repository contains no tests.** The `Tests\` folder described below was lost on
-the machine the 1.0.5 work was done on, before any of it was committed, and this repository's history
-holds no earlier copy of it either — there is nothing to restore from git and nothing for
-`Invoke-Pester` to run. What follows is therefore the **specification** of the suite: what it covered
-when it existed, and what it would have to cover again. Until it is rebuilt, the text handling that
-decides where a line lands in an INF is checked by reading the code and by real driver runs, not by a
-test run.
+**Status first: `Tests\` is not in the working tree.** Commit `71ea1de` deleted the folder, and what
+it deleted was the only two files the suite ever had in git - `PatchToolDiscovery.Tests.ps1` (44 cases
+over 9 `Describe` blocks) and `InfPatchIntegrity.Tests.ps1` (12 cases over 4 `Describe` blocks), both
+at their pre-1.0.5 revision, since `0245335` changed neither. Their last committed contents are one
+command away:
+
+```powershell
+git show 0245335:Tests/PatchToolDiscovery.Tests.ps1
+git show 0245335:Tests/InfPatchIntegrity.Tests.ps1
+```
+
+The two other suites described below were written but never committed, so no git object holds them.
+`Invoke-Pester Tests` on a fresh checkout finds nothing; what follows describes what the suite covered
+when it existed, and what would have to be rebuilt. Until then, the text handling that decides where a
+line lands in an INF is checked by reading the code and by real driver runs, not by a test run.
 
 The parts of this toolkit that decide *where a line goes in an INF* are pure text handling, which
 means they can be tested without a driver download, a certificate, or a machine willing to boot the
@@ -715,14 +731,19 @@ afterwards. Four of its eight cases failed against the previous revision of
 `Remove-ForeignOemInfs.ps1`, which was the point: they pinned fixes, not the code as it then read.
 
 Pester 3.4 is what ships with PowerShell 5.1, so a rebuilt suite should use its syntax and run on
-5.1 and 7 - the same two interpreters the scripts themselves have to work on. These are the cases
-worth having before touching the section walk or the matching rules, which are the two places where a
-wrong answer looks exactly like a successful patch.
+5.1 and 7 - the same two interpreters the scripts themselves have to work on. The two committed files
+were 56 cases between them, and the last of those additions (`9bc086a`) was the installer/expansion
+picker: which `setup.exe` and which unpacked folder a scratch tree resolves to, decided by the
+timestamp in `setup.cfg` or by the version written in the path. Those are the cases worth restoring
+before touching the section walk or the matching rules, which are the two places where a wrong answer
+looks exactly like a successful patch.
 
 What that leaves in place today is the gate in [The verification gate](#the-verification-gate) and the
 runs in [Verified driver releases](#verified-driver-releases) - one gate that reads the finished INFs,
-and four recorded driver runs, none of them against 1.0.4 or 1.0.5. The gate has documented limits of
-its own (see the two caveats there), which is the other reason a rebuilt suite matters: the four
+and four recorded driver runs, none of them against 1.0.4 or 1.0.5. Restoring the two committed files
+gets you back 56 cases, but they are the pre-1.0.5 revisions: they exercise the 1.0.4 helpers, so they
+need updating before they are meaningful against these scripts. The gate has documented limits of its
+own (see the two caveats above), which is the other reason a rebuilt suite matters: the four
 highest-value cases to write first are the ones the gate currently cannot fail - an `RM1457588`
 mention that is only a comment, a whitelisted device line reusing a stock section with a dead
 `AddService` target, a device block whose header is repeated, and a `whitelist.json` whose entries do
@@ -752,8 +773,9 @@ cannot be checked from a clone.
 No end-to-end run is recorded against 1.0.4, 1.0.5 or against the current working tree: the newest
 runs in the table above were made by 1.0.3, and everything added since then is in
 [CHANGELOG.md](CHANGELOG.md) under
-[1.0.5](CHANGELOG.md#105---2026-10-23). Nothing in this repository covers that gap: the test suite
-described in [Tests](#tests) is not in the tree, and the run logs the table is read from are git-ignored.
+[1.0.5](CHANGELOG.md#105---2026-10-23). Nothing runnable in this repository covers that gap: the test
+suites are no longer in the tree (see [Tests](#tests)), and the run logs the table is read from are
+git-ignored.
 A suite exercising the INF text handling and the gate end to end against a synthetic package is the
 missing piece, and it is not a substitute for a real run on real hardware either way - a driver
 release that is not listed above is still unverified in the sense that matters.
