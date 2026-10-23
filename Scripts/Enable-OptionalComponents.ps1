@@ -101,7 +101,11 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
 
     foreach ($r in $resolved) {
         $infsSeen++
-        $lines = [System.Collections.Generic.List[string]](Get-Content -Path $r.Path -Encoding UTF8)
+        # Read through the shared reader so the writer below can put the file back with the encoding
+        # and line endings it already had: Get-Content -Encoding UTF8 turns a legacy-codepage INF into
+        # replacement characters that then get written back as real bytes.
+        $state = Get-InfTextFile -Path $r.Path
+        $lines = [System.Collections.Generic.List[string]](@($state.Lines))
 
         # Index section bounds, and count how many device lines point at each section.
         $bounds = @{}
@@ -182,7 +186,7 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
 
         if ($addedHere -gt 0) {
             if ($PSCmdlet.ShouldProcess($r.Path, "Write component feature flags")) {
-                Write-InfLines -Path $r.Path -Lines $lines
+                Write-InfLines -Path $r.Path -Lines $lines -State $state
             }
             $totalAdded += $addedHere
         }
@@ -208,7 +212,12 @@ if (-not $SkipInstallerSelectable) {
         Write-Warning "setup.cfg not found under $PackageRoot - skipping the NVIDIA App selectability change."
     }
     else {
-        $cfg = Get-Content $setupCfg -Raw -Encoding UTF8
+        # Read through the shared reader, and keep the original bytes for the rollback below. setup.cfg
+        # is written by NVIDIA's own tooling, and a writer that always drops the BOM or always emits
+        # UTF-8 edits bytes no patch intended to touch - which is exactly what the catalog then hashes.
+        $cfgState = Get-InfTextFile -Path $setupCfg
+        $cfg = $cfgState.Text
+        $cfgOriginalBytes = [System.IO.File]::ReadAllBytes($setupCfg)
         $rx = [regex]'(?<open><sub-package\b[^>]*?\bname\s*=\s*"Display\.NvApp"[^>]*?>)'
         $m = $rx.Match($cfg)
         if (-not $m.Success) {
@@ -228,13 +237,13 @@ if (-not $SkipInstallerSelectable) {
                     $newOpen = $open -replace '\s*>$', ' userSelectable="true">'
                 }
                 if ($PSCmdlet.ShouldProcess($setupCfg, "Make Display.NvApp user-selectable")) {
-                    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-                    [System.IO.File]::WriteAllText($setupCfg, $cfg.Remove($m.Index, $open.Length).Insert($m.Index, $newOpen), $utf8NoBom)
+                    Write-InfText -Path $setupCfg -Text $cfg.Remove($m.Index, $open.Length).Insert($m.Index, $newOpen) -State $cfgState
 
-                    # Verify structurally rather than trusting the replace, and put the original
-                    # back if the edit did not come out as intended - $cfg still holds it.
+                    # Verify structurally rather than trusting the replace, and put the file back if the
+                    # edit did not come out as intended - the rollback writes the bytes it read, so a
+                    # file that was untouched by a successful patch is byte-for-byte what it was.
                     try {
-                        try { $xml = [xml](Get-Content $setupCfg -Raw -Encoding UTF8) }
+                        try { $xml = [xml]((Get-InfTextFile -Path $setupCfg).Text) }
                         catch { throw "setup.cfg is no longer valid XML after the edit. $_" }
                         $node = @($xml.GetElementsByTagName('sub-package')) | Where-Object { $_.name -eq 'Display.NvApp' } | Select-Object -First 1
                         if (-not $node) { throw "setup.cfg parses but Display.NvApp is gone." }
@@ -242,7 +251,7 @@ if (-not $SkipInstallerSelectable) {
                     }
                     catch {
                         try {
-                            [System.IO.File]::WriteAllText($setupCfg, $cfg, $utf8NoBom)
+                            [System.IO.File]::WriteAllBytes($setupCfg, $cfgOriginalBytes)
                             Write-Warning "setup.cfg restored to its previous contents."
                         }
                         catch { Write-Warning "COULD NOT restore setup.cfg - re-copy it from the source package." }

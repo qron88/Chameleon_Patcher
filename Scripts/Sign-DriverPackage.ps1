@@ -32,6 +32,14 @@
   An un-timestamped signature stops validating once the signing certificate itself expires, which
   for a local 3-year test-signing cert is not a practical concern.
 
+  ONE CATALOG PER INF, AND ONLY FOR THE INFs THAT ARE STILL THERE. A driver folder holds one .cat per
+  INF, and a folder that has been patched or pruned more than once also holds catalogs whose INF is
+  long gone, because Inf2Cat writes catalogs for the INFs it finds and never deletes anything. Those
+  leftovers are reported and left unsigned: signing a catalog for files the current INFs no longer
+  name is how a package ends up installing things nothing declares. A catalog whose INF is still in
+  the folder is signed even if Inf2Cat did not rewrite it, since something in the package wants it,
+  but with a warning that Inf2Cat did not confirm what it covers.
+
   This script does NOT modify any system trust store or enable Windows Test Mode - see README.md
   for the (separate, explicit) steps required for Windows to actually trust the result.
 
@@ -146,15 +154,53 @@ else {
 try {
     # --- Rebuild the catalog ------------------------------------------------------------------
     Write-Host "`nRebuilding catalog from patched INFs..." -ForegroundColor Cyan
+    # Snapshot the catalogs that are already in the folder before Inf2Cat runs. Inf2Cat writes one
+    # .cat for every INF it certifies and leaves the rest of the folder alone, so once it is done a
+    # catalog that is new or whose timestamp moved is one that describes the INFs as they now are,
+    # while a catalog whose timestamp did not move describes something Inf2Cat never looked at -
+    # usually the leftover of an INF a previous run pruned away, or of an older driver that lived in
+    # this folder. Signing those anyway makes a green run out of a package that still carries a
+    # catalog for files its INFs no longer name.
+    $catBefore = @{}
+    foreach ($c in @(Get-ChildItem -Path $DisplayDriverPath -Filter '*.cat')) { $catBefore[$c.Name] = $c.LastWriteTimeUtc }
+
     $inf2catExit = Invoke-NativeTool -FilePath $inf2cat -Arguments @("/driver:$DisplayDriverPath", "/os:$OSList", "/verbose")
     if ($inf2catExit -ne 0) {
         throw "Inf2Cat failed with exit code $inf2catExit. Check the driver folder for INF errors."
     }
 
-    $catFiles = Get-ChildItem -Path $DisplayDriverPath -Filter "*.cat"
+    $catFiles = @(Get-ChildItem -Path $DisplayDriverPath -Filter "*.cat")
     if (-not $catFiles) { throw "No .cat file was produced by Inf2Cat." }
 
+    $refreshed = @($catFiles | Where-Object { (-not $catBefore.ContainsKey($_.Name)) -or ($_.LastWriteTimeUtc -ne $catBefore[$_.Name]) })
+    if (-not $refreshed.Count) {
+        # Possible when the same package is signed twice without an INF edit in between. Signing them
+        # again is idempotent, and refusing to sign anything here would be the louder wrong answer.
+        Write-Warning "Inf2Cat reported success but rewrote no .cat file - each catalog already matched its INF. Signing every catalog in the folder again."
+        $refreshed = $catFiles
+    }
+    $untouched = @($catFiles | Where-Object { $refreshed -notcontains $_ })
+    $stale = @(); $leftover = @()
+    foreach ($cat in $untouched) {
+        # An INF of the same name is still in the folder, so something in this package really does
+        # want this catalog, even though Inf2Cat did not regenerate it. Leave it in the signing list
+        # and say what is odd about it; a catalog that is not signed at all is worse than one whose
+        # freshness is doubtful.
+        if (Test-Path (Join-Path $DisplayDriverPath ([System.IO.Path]::GetFileNameWithoutExtension($cat.Name) + '.inf'))) { $stale += $cat }
+        else { $leftover += $cat }
+    }
+    if ($stale.Count) {
+        Write-Warning ("Inf2Cat did not rewrite these catalogs even though an INF of the same name is in the folder: " + (($stale | ForEach-Object { $_.Name }) -join ', ') + ". They are signed anyway, but a catalog Inf2Cat did not regenerate does not necessarily cover the INF that was just patched.")
+    }
+    if ($leftover.Count) {
+        Write-Warning ("Not signing, because no INF in $DisplayDriverPath names them and Inf2Cat did not touch them: " + (($leftover | ForEach-Object { "$($_.Name) (last written $($_.LastWriteTime))" }) -join ', ') + ". A catalog outlives the INF it was built for when a package is pruned or reused, and signing it would only dress the leftover up as current.")
+    }
+
     # --- Sign each catalog produced -----------------------------------------------------------
+    $toSign = @($refreshed + $stale)
+    if ($leftover.Count) {
+        Write-Host ("Signing $($toSign.Count) of $($catFiles.Count) .cat file(s) in the folder; $($leftover.Count) left unsigned as leftovers of INFs that are no longer here.") -ForegroundColor Yellow
+    }
     function Get-SignArguments {
         param([string]$CatPath, [bool]$WithTimestamp)
         $a = @('sign')
@@ -170,7 +216,7 @@ try {
         return $a
     }
 
-    foreach ($cat in $catFiles) {
+    foreach ($cat in $toSign) {
         Write-Host "`nSigning $($cat.Name)..." -ForegroundColor Cyan
 
         $timestamped = $false
@@ -213,7 +259,8 @@ try {
         }
     }
 
-    Write-Host "`nDone. $($catFiles.Count) catalog(s) rebuilt and signed." -ForegroundColor Green
+    $skippedNote = if ($leftover.Count) { " $($leftover.Count) catalog(s) of INFs no longer in the folder were deliberately left unsigned." } else { "" }
+    Write-Host "`nDone. $($toSign.Count) catalog(s) rebuilt and signed.$skippedNote" -ForegroundColor Green
     Write-Host "This signature only validates once the signing certificate is trusted by Windows -" -ForegroundColor Yellow
     Write-Host "see README.md for that step, which you should run yourself." -ForegroundColor Yellow
 }

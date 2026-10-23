@@ -63,7 +63,13 @@ $infsSeen = 0
 
 Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
     $path = $_.FullName
-    $lines = [System.Collections.Generic.List[string]](Get-Content -Path $path -Encoding UTF8)
+    # Read through the toolkit's shared reader, which reports the encoding the file really is and the
+    # line endings it really uses, and hand that report back to the writer below. Get-Content -Encoding
+    # UTF8 turns any non-UTF-8 byte in the file into U+FFFD, and rewriting from those lines replaces
+    # what was there; it also re-joins every line with CRLF, which is a whole-file diff on an INF that
+    # NVIDIA shipped with LF.
+    $state = Get-InfTextFile -Path $path
+    $lines = [System.Collections.Generic.List[string]](@($state.Lines))
 
     $miscHeaderIdx = New-Object System.Collections.Generic.List[int]
     $allHeaderIdx = New-Object System.Collections.Generic.List[int]
@@ -100,7 +106,7 @@ Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
     }
 
     if ($patchedHere -gt 0) {
-        Write-InfLines -Path $path -Lines $lines
+        Write-InfLines -Path $path -Lines $lines -State $state
         Write-Host ("  {0}: added RM1457588 to {1} section(s)" -f $_.Name, $patchedHere)
         $totalPatched += $patchedHere
         $totalFiles++

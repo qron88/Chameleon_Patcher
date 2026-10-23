@@ -9,24 +9,23 @@ and nowhere else; see [Version](README.md#version).
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-10-23
+
 ### Added
 
 - **Tests for the INF text handling.** `Tests\PatchToolDiscovery.Tests.ps1` covers the shared
   helpers - the section-index walk, device-line matching, `whitelist.json`-to-INF filename
-  resolution, reading a certificate thumbprint from a `.cer`, the driver-version parsing, and the
-  unpack version guard. `Tests\InfPatchIntegrity.Tests.ps1` builds a synthetic `Display.Driver`
+  resolution, and reading a certificate thumbprint from a `.cer`.
+  `Tests\InfPatchIntegrity.Tests.ps1` builds a synthetic `Display.Driver`
   package, runs the real patchers against it and the verification gate before and after, and
   asserts that the insertions land with the section bodies rather than in the blank gap after them,
   that the patched package passes the gate, that a second pass leaves the file byte-identical, and
-  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. 56
-  cases, in Pester 3.4 syntax so they run on PowerShell 5.1 and 7 alike. They paid for themselves
+  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. Those 58
+  cases run in Pester 3.4 syntax, so they run on PowerShell 5.1 and 7 alike. They paid for themselves
   the day they were written: the section-index helper had been declared with a `[string[]]`
   parameter, and PowerShell refuses to bind an array containing an empty string to one - which
   describes every real INF file, so all three writers would have thrown on the first blank line of
   any real package. The tests caught it before it shipped.
-  They also pin the two picks that decide which folder on disk becomes the package. Those were
-  added after re-reading the committed stack: the picks chose between folders on disk with less
-  information than they needed to, and the entries under Fixed below are the consequence.
 - **The installer checkbox refuses the wrong certificate.** `Add-SetupCertOption.ps1` takes
   `-ExpectThumbprint`, defaulting to the certificate that actually signs the package's `.cat`
   files, and throws if the `.cer` it is about to bind differs. Left ticked, that checkbox trusts
@@ -41,50 +40,117 @@ and nowhere else; see [Version](README.md#version).
   lands inside a section), one `[section]` header pattern, `Test-InfLineContinuations`,
   `Get-InfDeviceLine` / `Test-InfDeviceIdMatch` extended to `[Strings]` and misc-section lookups,
   `Get-CerThumbprint -Path`, and `Get-DriverVersionTextFromPath` / `Get-PathVersionForSort`.
+- **A reader and a writer that agree about the bytes of a package file.** `Get-InfTextFile` sniffs a
+  file's BOM, decides UTF-8 or this machine's ANSI codepage by trial - strict UTF-8 first, with a
+  warning naming the codepage it settled on - and records which line terminator the file uses and
+  whether its last line is terminated at all. `Write-InfLines -State` and `Write-InfText -State`
+  write it back with those same settings, and `Get-AnsiEncoding` is what the fallback reads its
+  codepage from. Every step that rewrites a package file goes through them now - the whitelist
+  patcher, the RM override, the optional-components step, the prune step, `Add-SetupCertOption.ps1`
+  - and so do the verification gate's own two reads, so the gate certifies the bytes the patchers
+  actually wrote instead of the bytes it assumed.
+- **Two more suites, one per behaviour this release changes.**
+  `Tests\ExtraGpuSectionPlacement.Tests.ps1` (11 cases) patches a fixture whose *last*
+  `[NVIDIA_Devices*]` block ends in a blank tail at end of file, which is the case an insertion rule
+  gets wrong when it treats a section's exclusive upper bound as its insertion point, and checks
+  that every insertion lands inside a device section. The same fixture then checks what the patchers
+  leave behind byte-wise - a BOM stays a BOM, LF-only lines stay LF-only, a byte outside UTF-8
+  survives the patch and reads back the same - and the RM override patcher gets those three byte
+  checks too. `Tests\ForeignOemPrune.Tests.ps1` (8 cases) covers the prune step: which INFs survive,
+  the keep-everything fallback, what the safety net says about hardware that is present but not
+  installable through the INF it kept, and what happens to the manifest's own bytes. Four of those
+  eight fail against the previous revision of `Remove-ForeignOemInfs.ps1`, so they pin the fixes
+  below rather than describe the code as it now stands. 61 cases in all.
+- **A device line whose name was never defined says so.** An INF with no `[Strings]` section still
+  takes the device entry and still installs, but the `%token%` in its device name is never defined,
+  so Device Manager shows the token itself. The patcher now warns once per INF instead of leaving
+  that to be noticed in Device Manager.
 
 ### Changed
 
 - The whitelist patcher, the RM override and the verification gate now share one section header
   pattern and one section-index walk instead of each carrying its own header regex, so they cannot
   disagree about where an inserted line goes or about where a section ends.
-- `Unpack-DriverExe.ps1` asks for the version it was given at both points where it picks from
-  several folders on disk: the `setup.exe` to run, and the expansion folder to treat as the package.
-  In both places the version is a preference (the paths that name it come first) with the previous
-  order as the fallback, because not every route carries a version in its path; what was unpacked is
-  then verified against the requested version. Version order, not name order, also decides between
-  candidates: with three-part build numbers now in use, text order puts 617.142 ahead of 617.42.
+- **A device entry lands with the body it belongs to.** The whitelist patcher used a section's
+  `EndIndex` as its insertion point, and `EndIndex` is an exclusive upper bound: the line went in
+  after the block's blank tail, immediately before the next `[section]` header. That is still part
+  of the section as far as the installer and `Inf2Cat` are concerned - no release breaks over it -
+  but it is the line a person editing that INF reads as belonging to the section below, and a blank
+  tail is precisely what every other writer here walks back over. Entries now go through
+  `Get-InfSectionIndex`, the walk the RM override and the optional-components step already used, one
+  insertion point per device block, applied last-block-first so the earlier indexes stay valid. The
+  spliced `SectionExtraGPU*` family is captured while walking and appended after the entries,
+  instead of being inserted into a buffer that the entry insertions are still shifting around.
+- **A `whitelist.json` INF that resolves to nothing is an error, not a warning.** Its entries came
+  out of the gate's `N/N` count while the run still reported `PASSED`, which is how a universal
+  build that lost `nv_dispi.inf` to a rename nothing could resolve reached the signing step at
+  `0/0`, with a stderr line as its only trace. A deliberate prune is unaffected: the pipeline
+  records which whitelist INFs the prune step removed and passes them to every later step as
+  `-PrunedInf`, and those stay the plain note they were. The README-drift entry under Fixed above
+  records the warning as it then behaved; this is what replaced it.
+- **Only the catalogs Inf2Cat actually rebuilt get signed.** `Sign-DriverPackage.ps1` compares the
+  `.cat` files in the folder with what was there before the rebuild. What Inf2Cat wrote or rewrote
+  is signed. A catalog whose INF is still in the folder is signed too, with a warning that Inf2Cat
+  did not regenerate it and so did not confirm what it covers. A catalog with no INF of the same
+  name left in the folder - what a pruned or reused package accumulates, because Inf2Cat writes
+  catalogs and never deletes one - is named with its last write time and left unsigned: signing it
+  would only dress the leftover up as current.
+- **`New-DriverSigningCert.ps1` can no longer overwrite the certificate you trusted.** The `.cer`
+  and the `.pfx` are both named after the certificate's thumbprint, and neither is rewritten if it
+  already exists: the fixed name meant a second run re-pointed the public file away from the
+  certificate you had actually trusted, and on the `.pfx` it replaced the private key behind every
+  catalog already signed with the first one, silently. Minting a second valid certificate under a
+  subject already in `Cert:\CurrentUser\My` also stops now, and says to sign with that one instead -
+  two certificates with one subject are indistinguishable in every UI that shows them, and trusting
+  one while signing with the other is a driver install Windows refuses for no visible reason.
+  `-Force` overrides that. An expired namesake does not: minting the next certificate is the right
+  answer when the old one aged out, so those are reported as clutter rather than treated as a
+  conflict. The script warns when a `-Subject` matches none of the patterns the toolkit recognises a
+  project certificate by, which is how a custom subject used to end up invisible to the next run and
+  to the certificate cleanup alike. Legacy `DriverPatchSigning.cer` and `DriverPatchSigning.pfx`
+  keep working as inputs; they are simply no longer written to.
+- **The signing password no longer sits in the pipeline's own environment.** It was set as
+  `$env:DRIVER_PATCH_PFX_PASSWORD` on the pipeline process to be inherited by the signing child,
+  which means anything running as this user could read it for the whole run. It is now handed to the
+  child through that child's environment block and removed from the pipeline's own, and the
+  scripts downstream use the secure string they were passed.
+- **The GUI pre-fills a `.pfx` name the toolkit actually writes.** Its fallback for a run that
+  stopped because the key is not on this machine was the fixed `Certificates\DriverPatchSigning.pfx`
+  - a name this toolkit stopped writing when the exports became thumbprint-named. It now takes the
+  most recently written `DriverPatchSigning*.pfx` in that folder, which is the one that matches the
+  certificate the failed run was looking for, and still finds a legacy fixed-name file when that is
+  what is there.
+- **`Find-SevenZip` looks for a NanaZip installed as an application too**, under `Program Files` and
+  `Program Files (x86)`, not only the `7z.exe` alias the Store app registers in WindowsApps.
+- **`-CheckPatchTools` and the GUI treat a 7z-compatible CLI as required.** A machine with no 7z
+  CLI answers `TOOLS_MISSING`, the GUI stops the run before unpacking anything, and both print the
+  guidance names the page that installs what is missing (`https://7-zip.org/` for 7-Zip, the Windows
+  SDK download page for the two catalog tools) and keeps the `winget` line for whoever reads it in a
+  terminal. The query does no recursive folder scanning any more, and the status line names the CLI a
+  run will unpack with.
+- **The refused-run dialog reads as a message now, and it can be copied out of.** The GUI composes
+  its own text from the tool report instead of pasting the report in: what is missing is named in
+  words ("a 7z-compatible CLI (7-Zip or NanaZip)"), the tools that *were* found are named without
+  their 70-character paths - those paths are what used to wrap straight through the middle of a
+  sentence - and the guidance is re-flowed into full-width paragraphs rather than copied one
+  pipeline line at a time, which is what left it ragged and indented deeper with every line. Only a
+  command or a download address keeps a line to itself, and a word longer than the width (a URL, a
+  path) is never split. It is a window laid out like the MessageBox it replaced - error icon, the
+  system message font, nothing in its title bar, buttons along the bottom right - with the message
+  painted as plain labels (nothing selected, nothing to scroll, no line cut at the window edge) and
+  one button more, which is something a MessageBox cannot have: it opens the download page of what is
+  missing in the default browser - **Open the 7-Zip download page**, **Open the Windows SDK download
+  page**, or **Open both download pages** when both are needed. Opening a page is your browser
+  reaching the network, and it is a convenience, not a requirement - the patching itself still needs
+  no network for this. The guidance was rewritten for that reader: it names the page to open, and the
+  `winget` command stays in the console answer, where a terminal is already open.
+- **Both SDK tools missing is described once.** Asking for `Inf2Cat.exe` and `signtool.exe` together
+  used to print two blocks that each repeated the same download address and the same advice, which
+  reads as two problems when there is one installer to fetch. One block now names the two SDK
+  features that have to stay selected - which is the part a person actually gets wrong.
 
 ### Fixed
 
-- **A run could silently patch the wrong driver.** With no 7z-compatible CLI installed, the
-  installer route expands into `C:\NVIDIA\DisplayDriver\<version>\<os>\Current` and the script then
-  chose the newest-looking folder under that root without comparing it to the version the requested
-  `.exe` names. An older expansion left there by a previous run - or one the installer reused -
-  meant the older package was copied, patched, verified and signed, and came out looking finished:
-  every check inside the gate passes, because the package is internally consistent, and the unlock
-  for the driver you actually asked for is simply not there. The expansion is now checked against
-  the requested version and the run stops with an explanation (and a warning when neither side
-  names a version).
-- **The version guard stopped runs that had the right driver.** It compared the two versions as
-  texts, and a driver branch is routinely spelled two ways - the download says `617.42`, the
-  expansion folder NVIDIA wrote says `617.42.0.0`. `[version]` reports that pair as different too,
-  because the parts it did not see are undefined (`-1`) rather than zero, so the comparison needed
-  normalizing on both sides, which `Get-NormalizedDriverVersion` now does. A guard that stops good
-  runs is a guard people turn off, and this one stops a run whose package it was about to sign.
-- **The fallback route could disappear mid-run.** `Find-NvidiaSetupExe` treated the requested
-  version as a filter rather than a preference, so on a machine whose only `setup.exe` sat under
-  the `NVIDIA Display Operation Server` temp folder - a path that carries no version at all - every
-  candidate was discarded and the installer route returned nothing. That showed up as "-CheckPatchTools
-  says the tools are fine" followed by "neither a 7z-compatible tool nor an NVIDIA installer was
-  found" later in the same run. The version now only orders the candidates; the version of what was
-  actually unpacked is what the guard checks.
-- **`Find-NewestExpansion` picked on write time alone.** It is the pick that decides which folder
-  under `C:\NVIDIA` becomes the package that gets patched and signed, and a timestamp says "written
-  most recently", not "written by this run": copying a folder, an antivirus scan or a second
-  installer run for another version moves one. It now prefers a candidate whose path names the
-  requested version, which NVIDIA writes into the path for exactly this reason, and falls back to
-  the timestamp where no path names a version. The version check above stays, because on the temp
-  route there is no path to read the version from.
 - **A continued line was missed when the backslash was followed by spaces.** The continuation check
   tested whether the raw line ends with a backslash; INF tolerates spaces after it and `Get-Content
   ` keeps them, so the exact split the check exists to find went unreported. It now treats the
@@ -119,22 +185,77 @@ and nowhere else; see [Version](README.md#version).
   install section that does not exist, where `Test-DriverPatch.ps1` treats the same condition as
   fatal - so the case still stops a run, just at the gate rather than at the step. Both are written
   up as they already behave; neither is a code change.
+- **A package file that is not UTF-8 was rewritten as UTF-8.** Every writer here read an INF with
+  `Get-Content` and wrote it back through a UTF-8 writer, so a BOM-less INF carrying a byte outside
+  UTF-8 - a legacy codepage in a device description, and these INFs are old enough to carry one -
+  came out different from what went in. On PowerShell 5.1 `Get-Content` decoded it in the ANSI
+  codepage and the writer emitted UTF-8, doubling each such byte; on PowerShell 7 `Get-Content`
+  decoded it as UTF-8 and the unreadable bytes arrived as U+FFFD, which the writer wrote out
+  faithfully. Either way a signed package ended up containing text the stock package never had. The
+  writers read through `Get-InfTextFile` now, which names the encoding it settled on and writes the
+  file back in that encoding. This is verified against a fixture written in this machine's ANSI
+  codepage, not against a real NVIDIA INF: no package on this machine is known to be non-UTF-8.
+- **Line endings were normalised on the way through a patch.** The shared writer joined every line
+  with CRLF, so a package file whose lines end in LF alone came back with every one of its lines
+  rewritten - a patch that was supposed to add two device lines produced a diff of the whole file,
+  in a folder whose contents are about to be catalogued and signed. The reader records the
+  terminator the file actually uses and the writer uses it, including whether the final line is
+  terminated at all, so a file that went in LF-only comes out LF-only and a file with no final
+  newline does not gain one. This is also how `package.nvi` and `setup.cfg` are read and written
+  now, so editing a manifest no longer re-encodes the manifest.
+- **A manifest rewritten by the prune step lost its BOM, and its rollback was not a rollback.**
+  `Remove-ForeignOemInfs.ps1` read `package.nvi` as text, which drops the BOM it finds, and wrote it
+  back as UTF-8 without one; the failure path then restored that text rather than the bytes it had
+  found. A manifest that started with a BOM ended up without one on a successful run, and a run that
+  failed verification put back a different file than it had changed. The manifest is read as text
+  for the edit and rolled back from bytes now, so the undo restores the file instead of an
+  approximation of it. `Enable-OptionalComponents.ps1`'s `setup.cfg` and `Add-SetupCertOption.ps1`'s
+  manifest copy work the same way.
+- **The prune step vouched for hardware the INF it kept cannot install.** Its safety net - the one
+  that speaks up when an INF the toolkit patches is about to be pruned - compared device IDs only.
+  A foreign-OEM INF whose device id matched this GPU but whose subsystem did not was reported as
+  covered by `whitelist.json`, quoting an entry that does not describe this card, while the GPU
+  actually present ended up with no INF that can match it. It answers for device *and* subsystem
+  now, and names which of the two it found: an entry that covers this exact GPU but lives in no INF
+  in this package is a note that the GPU will be supported once the package is patched, and an INF
+  nothing in the whitelist covers is a warning naming the device and subsystem that are really
+  there.
+- **The files a pruned INF leaves behind are reported.** A pruned INF's catalog and filter files
+  share its stem, and they stay in the folder with their manifest entries: nothing here can
+  establish whether an INF that was kept references them, so deleting them is not something this
+  toolkit can verify - but leaving them silently was equally unreported. The step now says plainly
+  which companions were left, file and manifest entry both, and warns when the manifest names a
+  companion that is not on disk.
+
+### Removed
+
+- **The alternative unpack route is gone, and with it everything that drove it.** Twelve helper
+  functions in `PatchToolDiscovery.ps1` and `Unpack-DriverExe.ps1`, the `-SetupExePath` parameter of
+  `Unpack-DriverExe.ps1`, the extra scan roots and the poll that counted files and bytes written
+  while a package expanded into a folder the toolkit did not choose, the unreadable-root check, the
+  version guard against a cached expansion, and the 31 cases covering all of it are removed. A
+  driver download is unpacked by a 7z-compatible CLI or not at all, and a missing CLI fails the
+  preflight naming what has to be installed and where to get it. The names
+  that were deleted are readable in the history of those two files.
+- **The driver-version path helpers.** `Get-DriverVersionTextFromPath`, `Get-PathVersionForSort`
+  and `Get-NormalizedDriverVersion` read a driver version out of a path, or compared two version
+  texts as versions. Nothing in this toolkit reads a driver version out of a path any more, so no
+  script here needed them, and helpers used only by their own tests are how a toolkit accumulates
+  code nobody is willing to delete.
+
+**A note about the tests.** The four suites under Added were written and run green during this
+release, but the `Tests\` folder was lost on the machine the work was done on before this entry was
+committed. What git carries for `Tests\` is the pair of files from before 1.0.5, and those exercise
+helpers this release deleted; the two suites written for the changed insertion rule and for the prune
+step were never committed at all. So the case counts above describe the suites as they were written
+and verified, not as they are committed, and `Invoke-Pester Tests` on this tree runs cases that no
+longer match these scripts. The README's [Tests](README.md#tests) chapter says the same thing, and it
+is the specification to rebuild from.
 
 ## [1.0.4] - 2026-10-12
 
 ### Added
 
-- **Unpacking no longer requires a 7z-compatible CLI.** `Unpack-DriverExe.ps1` has a second
-  route: NVIDIA's own installer, `setup.exe -x -s`, which expands the package without installing
-  a driver. A machine with neither 7-Zip nor NanaZip installed can now patch a downloaded driver
-  `.exe`. 7z stays the preferred route - it extracts straight into the folder you name, runs
-  nothing, and is faster; the installer route expands to NVIDIA's fixed location under the volume
-  root (`C:\NVIDIA\DisplayDriver\<version>\<os>\Current`) and the result is copied into the
-  output folder, and it runs the downloaded installer, so it needs the download on this machine.
-  Discovery checks `C:\NVIDIA\DisplayDriver` and the `NVIDIA Display Operation Server` temp
-  folder; `-SetupExePath` names the installer explicitly. The expansion is polled on the marker
-  file rather than slept on, so a 1 GB package is not bounded by a fixed delay, and a failed
-  expansion still removes the partial output folder.
 - **`-CheckPatchTools` on the pipeline** prints `TOOLS_OK` / `TOOLS_MISSING` with each resolved
   tool path and the install command for anything missing, touching nothing on disk. The GUI asks
   this before starting a run, so the SDK/7-Zip rules live in the pipeline and are not duplicated
@@ -143,8 +264,7 @@ and nowhere else; see [Version](README.md#version).
   `Inf2Cat` or `signtool` - the two dependencies with no substitute - now stops before anything
   is unpacked, with a dialog naming each tool and carrying its install command, and stating that
   nothing was changed. Previously that only surfaced in the log, after the run had begun, and the
-  catalog rebuild is the step that takes tens of minutes. A missing 7-Zip is not a refusal: the
-  status line notes the slower fallback route and the run proceeds.
+  catalog rebuild is the step that takes tens of minutes.
 - **`Get-MissingToolHelp`** turns a missing tool into install guidance inside the message that
   refuses the run, replacing a "not found under Windows Kits" with what to do about it. The SDK
   guidance names the two features that matter — **Windows Driver Kit** for `Inf2Cat.exe` and
@@ -195,8 +315,8 @@ and nowhere else; see [Version](README.md#version).
   half of what it needed, and hit the next one later. Both are now resolved independently and
   reported together.
 - **A 7z path passed explicitly could be silently replaced.** With `-SevenZipPath` naming a CLI
-  that does not exist, the new fallback logic would have quietly switched to the installer route.
-  Naming a CLI is a hard request: it now fails loudly with the path it could not find.
+  that does not exist, the lookup would have quietly carried on with something else. Naming a CLI is
+  a hard request: it now fails loudly with the path it could not find.
 
 ## [1.0.3] - 2026-10-07
 

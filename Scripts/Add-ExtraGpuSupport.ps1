@@ -72,7 +72,11 @@ $whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
 
 function Find-DeviceBlocks {
     param([string[]]$Lines)
-    # Returns list of @{StartIndex; EndIndex} for each [NVIDIA_Devices...] section (end = index of blank/next-header line, exclusive)
+    # Returns one entry per [NVIDIA_Devices...] section: StartIndex is the first line after the
+    # header, EndIndex is EXCLUSIVE and is the index of the next section header, or end of file for
+    # the last block. It is not the end of that block's body - a blank line or a comment can sit
+    # between the last entry and the next header - so never insert at EndIndex directly; ask
+    # Get-InfSectionIndex for the position inside the body (see the insertion loop below).
     $blocks = @()
     for ($i = 0; $i -lt $Lines.Count; $i++) {
         if ($Lines[$i] -match $script:InfDeviceBlockRx) {
@@ -122,7 +126,12 @@ function Patch-InfFile {
     )
 
     Write-Host "`n=== $(Split-Path $Path -Leaf) ===" -ForegroundColor Cyan
-    $lines = [System.Collections.Generic.List[string]](Get-Content -Path $Path -Encoding UTF8)
+    # Read through Get-InfTextFile so the rewrite below can put the same bytes back: NVIDIA ships
+    # these INFs as BOM-less UTF-8 with CRLF, but an OEM INF in the same folder can be an old
+    # ANSI-codepage file, and the old -Encoding UTF8 read turned its accented vendor strings into
+    # U+FFFD and wrote them back that way.
+    $state = Get-InfTextFile -Path $Path
+    $lines = [System.Collections.Generic.List[string]](@($state.Lines))
 
     # Fail fast and loudly if this INF's layout isn't what we expect. Previously a missing
     # [NVIDIA_Devices...] block produced one warning PER ENTRY and then carried on to report
@@ -137,6 +146,7 @@ function Patch-InfFile {
     $addedCount = 0
     $skippedCount = 0
     $newSectionSuffix = 0
+    $stringsWarned = $false
 
     foreach ($entry in $Entries) {
         $dev = $entry.dev
@@ -175,12 +185,15 @@ function Patch-InfFile {
                 if ($same) { $targetSection = $same.Parsed.Section; break }
             }
         }
+        # A brand new family is only CAPTURED here; it is appended after the device lines have gone
+        # in. The append happens at end of file, and end of file is exactly where the last block's
+        # EndIndex points, so appending first made a device line land inside the new section.
+        # NVIDIA DDInstall sections split AddService into a separate "<Section>.Services" companion
+        # (and sometimes .Software/.HW/.GeneralConfigData) - Windows install fails with "No INF
+        # AddService directives contained SPSVCINST_ASSOCSERVICE" if only the base section is
+        # copied, so every companion has to be emitted too.
+        $familyLines = @()
         if (-not $targetSection) {
-            # Fall back: create a brand new section family from the captured template.
-            # NVIDIA DDInstall sections split AddService into a separate "<Section>.Services"
-            # companion (and sometimes .Software/.HW/.GeneralConfigData) - Windows install
-            # fails with "No INF AddService directives contained SPSVCINST_ASSOCSERVICE" if
-            # only the base section is copied, so every companion must be emitted too.
             $newSectionSuffix++
             $targetSection = "SectionExtraGPU$($dev)_$newSectionSuffix"
             $family = $entry.template_section_family
@@ -191,10 +204,9 @@ function Patch-InfFile {
             foreach ($prop in $family.PSObject.Properties) {
                 $suffix = $prop.Name
                 $body = $prop.Value
-                if (-not $body -or $body.Count -eq 0) { continue }
+                if (-not $body -or @($body).Count -eq 0) { continue }
                 $sectionName = if ($suffix -eq '_base') { $targetSection } else { "$targetSection.$suffix" }
-                $sectionLines = @("[$sectionName]") + $body + @("")
-                $lines.AddRange([string[]]$sectionLines)
+                $familyLines += [string[]](@("[$sectionName]") + @($body) + @(""))
             }
         }
 
@@ -207,11 +219,22 @@ function Patch-InfFile {
             "%$keyName% = $targetSection, PCI\VEN_10DE&DEV_$dev"
         }
 
-        # Only the blocks that lack the entry get the line. The template sections above were
-        # appended at the END of the file, so the block indices found before are still valid.
-        # Insert from the bottom-most block upward so earlier indices stay valid too.
-        foreach ($block in ($lacking | Sort-Object EndIndex -Descending)) {
-            $lines.Insert($block.EndIndex, $matchLine)
+        # Only the blocks that lack the entry get the line. The position comes from
+        # Get-InfSectionIndex, not from the raw EndIndex: EndIndex is the next header (or end of
+        # file), so a raw insert there lands after the block's trailing blank lines and comments,
+        # and for the LAST block - whose EndIndex is end of file - it landed inside whichever
+        # template section this very entry had just appended. Confirmed on a two-block fixture: the
+        # second entry's line turned up inside [NVIDIA_Devices.Section0] and its .Services body.
+        # Insert bottom-up so the earlier positions stay valid, and do all of it before the family
+        # append below, which is what would otherwise move end of file out from under those indices.
+        $insertAt = @($lacking | ForEach-Object {
+            Get-InfSectionIndex -Lines $lines -HeaderIndex ($_.StartIndex - 1) -EndIndex $_.EndIndex
+        })
+        foreach ($pos in ($insertAt | Sort-Object -Descending)) {
+            $lines.Insert($pos, $matchLine)
+        }
+        if (@($familyLines).Count -gt 0) {
+            $lines.AddRange([string[]]$familyLines)
         }
 
         # Add the [Strings] description if not already defined
@@ -227,6 +250,14 @@ function Patch-InfFile {
                 $lines.Insert($(Get-InfSectionIndex -Lines $lines -HeaderIndex $stringsBounds.HeaderIndex -EndIndex $stringsBounds.EndIndex), "$keyName = `"$desc`"")
             }
         }
+        elseif (-not $stringsWarned) {
+            # The device line this just inserted names %$keyName%, and with no [Strings] section that
+            # token is never defined: the entry still installs, but under an unresolved name. This is
+            # an INF layout the script had no way to describe, so say so once per file rather than
+            # once per entry - the answer is the same for every entry in the file.
+            $stringsWarned = $true
+            Write-Warning "$(Split-Path $Path -Leaf) has no [Strings] section, so the %token% names this patch inserted are never defined. The entries install but show an unresolved device name."
+        }
 
         $addedCount++
         $partial = if ($lacking.Count -lt $blocks.Count) { " [added to $($lacking.Count) of $($blocks.Count) device blocks; the rest already had it]" } else { "" }
@@ -237,7 +268,7 @@ function Patch-InfFile {
 
     if ($addedCount -gt 0) {
         if ($PSCmdlet.ShouldProcess($Path, "Write patched INF")) {
-            Write-InfLines -Path $Path -Lines $lines
+            Write-InfLines -Path $Path -Lines $lines -State $state
         }
     }
     return $addedCount

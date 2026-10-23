@@ -133,8 +133,12 @@ $componentDir = Join-Path $PackageRoot "GpuUnlockCert"
 
 # Read as UTF8 explicitly: the file has no BOM, and Windows PowerShell 5.1's auto-detection falls
 # back to the system ANSI codepage without one, which would corrupt any non-ASCII text.
-$cfg = Get-Content $setupCfgPath -Raw -Encoding UTF8
-$cfgOriginal = $cfg
+# Read through the shared reader so the BOM, the codepage and the trailing newline of this file are
+# known before anything edits it, and keep its bytes for the rollback in section 5. A writer that
+# always emits BOM-less UTF-8 would quietly rewrite bytes no part of this patch intended to touch.
+$cfgState = Get-InfTextFile -Path $setupCfgPath
+$cfg = $cfgState.Text
+$cfgOriginalBytes = [System.IO.File]::ReadAllBytes($setupCfgPath)
 
 # --- State classification -----------------------------------------------------------------------
 # This operation touches two independent things on disk: a component FOLDER and setup.cfg. There
@@ -233,7 +237,6 @@ else {
 # setup.cfg last, so an abrupt kill leaves at worst an unreferenced folder. Anything this script
 # can actually catch gets undone, so a failure leaves the package exactly as it was found rather
 # than half-patched.
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $createdDir = $false
 $wroteCfg = $false
 
@@ -249,19 +252,21 @@ try {
     # The component declares its disposition in two places, its own .nvi and the setup.cfg
     # sub-package. Keep them in step rather than betting on which one the installer prefers.
     if ($Unchecked) {
-        $nviText = Get-Content $nviDest -Raw -Encoding UTF8
-        $nviText = [regex]::Replace($nviText, '(<nvi\b[^>]*?)disposition="default"', '$1disposition="optional"', 1)
-        [System.IO.File]::WriteAllText($nviDest, $nviText, $utf8NoBom)
+        # Written back through the reader's state, so the .nvi that leaves this step is the file the
+        # template was, with one attribute changed and nothing else.
+        $nviState = Get-InfTextFile -Path $nviDest
+        $nviText = [regex]::Replace($nviState.Text, '(<nvi\b[^>]*?)disposition="default"', '$1disposition="optional"', 1)
+        Write-InfText -Path $nviDest -Text $nviText -State $nviState
     }
 
     if (-not $cfgPresent) {
-        [System.IO.File]::WriteAllText($setupCfgPath, $cfg, $utf8NoBom)
+        Write-InfText -Path $setupCfgPath -Text $cfg -State $cfgState
         $wroteCfg = $true
     }
 
     # --- 4. Verify the result structurally, not just that it still parses ----------------------
     try {
-        $xml = [xml](Get-Content $setupCfgPath -Raw -Encoding UTF8)
+        $xml = [xml]((Get-InfTextFile -Path $setupCfgPath).Text)
     }
     catch {
         throw "setup.cfg is no longer valid XML after patching. Error: $_"
@@ -291,7 +296,7 @@ catch {
     Write-Warning "Failed partway through - rolling back so the package is left as it was found."
     if ($wroteCfg) {
         try {
-            [System.IO.File]::WriteAllText($setupCfgPath, $cfgOriginal, $utf8NoBom)
+            [System.IO.File]::WriteAllBytes($setupCfgPath, $cfgOriginalBytes)
             Write-Warning "  setup.cfg restored to its previous contents."
         }
         catch { Write-Warning "  COULD NOT restore setup.cfg - re-copy it from the source package." }

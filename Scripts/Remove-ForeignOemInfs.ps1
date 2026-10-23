@@ -21,7 +21,10 @@
       which live in sibling subpackages this script never touches.
     - INF filenames appear in exactly ONE place outside the INFs themselves: the <manifest> in
       Display.Driver's .nvi. setup.cfg names no INF at all. So pruning means deleting files and
-      removing their manifest entries, and nothing else goes stale.
+      removing their manifest entries, and nothing else goes stale. The companions an OEM INF ships
+      with under the same stem, its .cat above all, are deliberately left in place along with their
+      manifest entries: nothing in a pruned package can be shown to want them, so pruning stays
+      reversible, and the verification step reports what was left behind.
 
   WHAT IT KEEPS. An INF survives if any of these hold:
     - It is named in whitelist.json, i.e. it is one this toolkit patches.
@@ -165,13 +168,19 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
     }
 }
 
+# Which detected hardware a stock INF actually covers, recorded as "DEV|SUBSYS" pairs. The safety
+# net used to read this back out of the keep reasons with a DEV-only substring test, which counted a
+# GPU as covered by an INF that can never install on it: an OEM INF line for DEV_25B8 under someone
+# else's subsystem matched, and the GPU that needs unlocking was reported as fine.
+$coveredTargets = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
 foreach ($inf in $allInfs) {
     # Deliberately NOT skipping INFs already in the keep set. An INF kept because this toolkit
     # patches it may ALSO be what supports one of the present GPUs - nv_dispi.inf carries a bare
     # DEV line for most desktop parts - and the safety net below decides whether a GPU is covered
     # by looking for a recorded hardware match. Skipping here left that match unrecorded and made
     # a perfectly supported GPU, e.g. an RTX 5070 Ti at DEV_2C05, warn as unsupported.
-    $lines = @(Get-Content $inf.FullName -Encoding UTF8)
+    $lines = @((Get-InfTextFile -Path $inf.FullName).Lines)
     foreach ($t in $uniqueTargets) {
         # Windows matches either an exact DEV+SUBSYS line, or a line with no SUBSYS, which covers
         # every subsystem of that device. Lines carrying extra qualifiers (&REV_xx, &CC_xxxxxx)
@@ -179,6 +188,7 @@ foreach ($inf in $allInfs) {
         # dropping one that does breaks the install. Shared rule: Test-InfDeviceIdMatch -Mode Hardware.
         $hit = [bool](Find-InfDeviceLine -Lines $lines -Dev $t.Dev -Subsys $t.Subsys -Mode Hardware)
         if ($hit) {
+            [void]$coveredTargets.Add("$($t.Dev)|$($t.Subsys)")
             $lbl = "DEV_$($t.Dev)"
             if ($t.Subsys) { $lbl += "&SUBSYS_$($t.Subsys)" }
             Add-Keep -Name $inf.Name -Why "matches present hardware $lbl"
@@ -229,18 +239,29 @@ if ($keep.Count -eq 0) {
 # whitelist.json is what adds it to the generic desktop INF. So a GPU only counts as unsupported
 # when no kept INF matches it AND the whitelist does not cover it either. That combination means
 # the pruned package could not install here, which is worth stopping to look at.
-$wlDevs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+# Both halves of the question are now subsystem-aware and ask it through the toolkit's shared rule.
+# The kept-INF half used to be a DEV-only substring test over the keep reasons, and the whitelist
+# half was a set of bare DEVs, so a GPU whose DEV appears in whitelist.json only under a different
+# vendor's SUBSYS was announced as "will be supported once patched" when the entry cannot install on
+# it. That is the false reassurance this net exists to catch, and on a pruned package it is the only
+# thing standing between a wasted 50-minute catalog build and an obvious warning.
+# Entries are limited to whitelist INFs that resolve in this package: an entry for an INF this
+# release does not ship cannot patch anything here, so it must not count as coverage.
+$whitelistKeysInPackage = @{}
 foreach ($key in $whitelist.PSObject.Properties.Name) {
-    foreach ($e in $whitelist.$key) { [void]$wlDevs.Add($e.dev) }
+    $whitelistKeysInPackage[$key] = (@(Resolve-WhitelistInf -DisplayDriverPath $displayDriver -InfName $key).Count -gt 0)
 }
+$wlEntries = @(Get-WhitelistEntries -Whitelist $whitelist | Where-Object { $whitelistKeysInPackage[$_.Key] })
 foreach ($t in $uniqueTargets) {
-    $matchedByKept = @($keep | Where-Object { $reasons[$_] -like "*DEV_$($t.Dev)*" }).Count -gt 0
-    if ($matchedByKept) { continue }
-    if ($wlDevs.Contains($t.Dev)) {
-        Write-Host ("  DEV_$($t.Dev) is not in any stock INF but IS in whitelist.json - it will be supported once patched.") -ForegroundColor DarkGray
+    if ($coveredTargets.Contains("$($t.Dev)|$($t.Subsys)")) { continue }
+    $lbl = "DEV_$($t.Dev)"
+    if ($t.Subsys) { $lbl += "&SUBSYS_$($t.Subsys)" }
+    $cover = Test-WhitelistCoversDevice -Entries $wlEntries -Dev $t.Dev -Subsys $t.Subsys
+    if ($cover) {
+        Write-Host ("  $lbl is not in any stock INF but IS in whitelist.json ($($cover.Key): $($cover.Description)) - it will be supported once patched.") -ForegroundColor DarkGray
         continue
     }
-    Write-Warning "DEV_$($t.Dev) is present in this machine, matches none of the INFs being kept, and is not in whitelist.json. The pruned package may not install on it. Pass -KeepInf for whichever INF supports it, or -IgnoreLocalHardware if you know better."
+    Write-Warning "$lbl is present in this machine, matches none of the INFs being kept, and whitelist.json has no entry that covers it. The pruned package may not install on it. Pass -KeepInf for whichever INF supports it, or -IgnoreLocalHardware if you know better."
 }
 
 # --- 5. Decide and report ----------------------------------------------------------------------
@@ -265,7 +286,7 @@ $pruneNames = @($prune | ForEach-Object { $_.Name })
 foreach ($n in @($keep)) {
     $p = Join-Path $displayDriver $n
     if (-not (Test-Path $p)) { continue }
-    foreach ($l in (Get-Content $p -Encoding UTF8)) {
+    foreach ($l in @((Get-InfTextFile -Path $p).Lines)) {
         # Strip a trailing "; comment" first, or it would be read as part of the last filename.
         $body = ($l -split ';', 2)[0]
         if ($body -match '^\s*(Include|Needs|CopyINF)\s*=\s*(.+)$') {
@@ -288,8 +309,12 @@ if (-not $PSCmdlet.ShouldProcess($displayDriver, "Remove $($prune.Count) OEM INF
 # it would rewrite the whole document and produce an enormous diff against what they shipped.
 # Removing just the matching elements keeps every other byte identical, and the result is parsed
 # and cross-checked against the folder afterwards.
-$nviText = Get-Content $nviPath -Raw -Encoding UTF8
-$nviOriginal = $nviText
+$nviState = Get-InfTextFile -Path $nviPath
+$nviText = $nviState.Text
+# The rollback restores the exact bytes that were there before, not a re-encoding of the text: this
+# file is the package manifest, so an encoding change here is fatal rather than cosmetic, and a
+# re-encoded rollback would leave the package damaged even on the "everything went back" path.
+$nviOriginalBytes = [System.IO.File]::ReadAllBytes($nviPath)
 $removedEntries = 0
 foreach ($n in $pruneNames) {
     $rx = [regex]('<file\s+name\s*=\s*"' + [regex]::Escape($n) + '"[^>]*/>')
@@ -307,19 +332,18 @@ foreach ($n in $pruneNames) {
 # parses, a manifest/disk mismatch - moves them back and restores the manifest, so the package is
 # left exactly as it was found. The staging folder sits in the package root (same volume, so a
 # move is a rename) and outside Display.Driver, so nothing that scans the driver folder sees it.
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $staging = Join-Path $PackageRoot (".prune-staging-" + [guid]::NewGuid().ToString('N'))
 $removedFiles = 0
 try {
     New-Item -ItemType Directory -Path $staging | Out-Null
-    [System.IO.File]::WriteAllText($nviPath, $nviText, $utf8NoBom)
+    Write-InfText -Path $nviPath -Text $nviText -State $nviState
     foreach ($f in $prune) {
         [System.IO.File]::Move($f.FullName, (Join-Path $staging $f.Name))
         $removedFiles++
     }
 
     # --- 6. Verify ----------------------------------------------------------------------------
-    try { $check = [xml](Get-Content $nviPath -Raw -Encoding UTF8) }
+    try { $check = [xml]((Get-InfTextFile -Path $nviPath).Text) }
     catch { throw "$nviPath is no longer valid XML after pruning. $_" }
 
     $manifestInfs = @($check.nvi.manifest.file | ForEach-Object { $_.getAttribute('name') } | Where-Object { $_ -like '*.inf' })
@@ -329,6 +353,27 @@ try {
 
     if ($orphanEntries.Count) { throw "Manifest still lists INFs that are gone from disk: $($orphanEntries -join ', ')" }
     if ($unlisted.Count)      { throw "INFs on disk are missing from the manifest: $($unlisted -join ', ')" }
+
+    # The comparison above covers INFs, which is all this step changes. It is worth looking one step
+    # wider at the files that belong to the INFs being removed - an OEM INF ships with companions
+    # under the same stem, its own .cat above all - because those are left exactly where they are:
+    # their entries stay in the manifest and their files stay on disk, and nothing here can tell
+    # whether a kept INF happens to want one. Saying so keeps the package honest about what it now
+    # contains, and a companion that is listed but missing from the folder is a disagreement between
+    # the manifest and the folder that this step did not cause but would otherwise inherit silently.
+    $manifestFiles = @($check.nvi.manifest.file | ForEach-Object { $_.getAttribute('name') })
+    $allOnDisk = @(Get-ChildItem $displayDriver -File | ForEach-Object { $_.Name })
+    $stems = @($pruneNames | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) })
+    $companions = @($manifestFiles | Where-Object {
+        ($stems -contains [System.IO.Path]::GetFileNameWithoutExtension($_)) -and ($pruneNames -notcontains $_)
+    })
+    $companionGone = @($companions | Where-Object { $allOnDisk -notcontains $_ })
+    if ($companionGone.Count) {
+        Write-Warning ("The manifest lists files named after a pruned INF that are not in the folder: $($companionGone -join ', '). That predates this run - pruning only removes the entries of INFs it moves out - but manifest and folder disagree.")
+    }
+    if ($companions.Count) {
+        Write-Host ("  Left in the package, file and manifest entry both: $($companions -join ', ')") -ForegroundColor DarkGray
+    }
 }
 catch {
     Write-Warning "Failed partway through - moving the INFs back and restoring the manifest."
@@ -337,7 +382,7 @@ catch {
         try { [System.IO.File]::Move($s.FullName, (Join-Path $displayDriver $s.Name)) }
         catch { $restoreFailed++ }
     }
-    try { [System.IO.File]::WriteAllText($nviPath, $nviOriginal, $utf8NoBom) }
+    try { [System.IO.File]::WriteAllBytes($nviPath, $nviOriginalBytes) }
     catch { $restoreFailed++ }
     if ($restoreFailed -eq 0) {
         Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue

@@ -43,8 +43,10 @@
   Print findings but never throw. Without this, any error-class finding throws.
 
 .PARAMETER PrunedInf
-  Whitelist INF names the prune step removed on purpose. Their absence is reported as a note,
-  not as a warning that NVIDIA may have renamed or dropped them.
+  Whitelist INF names the prune step removed on purpose. Their absence is reported as a note. A
+  whitelist INF missing for any other reason is an error-class finding, not a warning: it means
+  those entries were never checked, and a package whose entries went unchecked cannot be
+  certified before its catalog is signed.
 
 .PARAMETER SkipRmOverrideCheck
   Don't assert the RM1457588 override (use if you ran the pipeline with that step skipped).
@@ -180,7 +182,15 @@ foreach ($prop in $whitelist.PSObject.Properties) {
             Write-Host "  $($prop.Name) was pruned from this package - its $(@($prop.Value).Count) entries do not apply and are not checked." -ForegroundColor DarkGray
         }
         else {
-            $warnings.Add("$($prop.Name) is not in this package, and nor is any same-stem variant of it - $($prop.Value.Count) whitelist entries could not be checked. NVIDIA may have renamed or dropped this INF.")
+            # An error, not a warning. This gate is the thing standing between a package whose unlock
+            # silently never happened and a signature that makes it look finished, and a whitelist INF
+            # that cannot be found in the package is precisely that: those entries went unchecked,
+            # and the GPUs they describe are the reason the run was done at all. -PrunedInf already
+            # covers the one legitimate way a whitelist INF is missing, namely that this run pruned it
+            # away on purpose, so anything left here means the release renamed or dropped the file, or
+            # the whitelist names something this package never had. Either way the package cannot be
+            # certified, and -ReportOnly remains the way to look without failing.
+            $errors.Add("$($prop.Name) is not in this package, and nor is any same-stem variant of it - $(@($prop.Value).Count) whitelist entries could not be checked, so this package cannot be certified as patched. NVIDIA may have renamed or dropped this INF; if this run pruned it on purpose, name it in -PrunedInf.")
         }
         continue
     }
@@ -198,7 +208,11 @@ foreach ($t in $targets) {
     $aka = ""
     if (-not $t.Exact) { $aka = " (this release's name for $($t.Key))" }
 
-    $lines = Get-Content -Path $infPath -Encoding UTF8
+    # Read with the same reader the patchers write with, so the gate checks the bytes that are really
+    # in the file rather than a re-decoding of them: an INF in a legacy code page read as UTF-8 comes
+    # back with U+FFFD where its comments are, and a gate that sees different text from the patcher is
+    # a gate that can disagree with it.
+    $lines = @((Get-InfTextFile -Path $infPath).Lines)
     # A device entry, [Strings] definition or RM override split across physical lines with a
     # trailing backslash is invisible to every per-line matcher below, which would then certify an
     # INF it only partly read. Report it rather than pass over it.
@@ -298,7 +312,7 @@ if (-not $SkipRmOverrideCheck) {
     $infsWithRmSections = 0
 
     Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
-        $sections = Get-InfSections -Lines (Get-Content -Path $_.FullName -Encoding UTF8)
+        $sections = Get-InfSections -Lines @((Get-InfTextFile -Path $_.FullName).Lines)
         $found = 0
         foreach ($k in $sections.Keys) {
             if ($k -notmatch '^nv_miscBase_addreg__\d+$') { continue }

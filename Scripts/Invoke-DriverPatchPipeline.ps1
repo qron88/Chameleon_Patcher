@@ -75,10 +75,10 @@
 
 .PARAMETER CheckPatchTools
   Print which external tools this machine can resolve and stop, without touching anything.
-  Reports Inf2Cat, signtool, a 7z-compatible CLI, and NVIDIA's installer as the 7z-free unpack
-  fallback. A missing 7-Zip is reported as a note, not a failure - the fallback covers it. A
-  missing Inf2Cat or signtool is a failure, and the report carries the install command for it.
-  Used by the GUI so the tool rules live in exactly one place.
+  Reports Inf2Cat, signtool and a 7z-compatible CLI, and answers TOOLS_MISSING when any of them is
+  absent: unpacking a driver .exe needs a 7z-compatible CLI now, so a machine without one cannot run
+  this toolkit at all. The report carries the install command for whatever is missing. Used by the
+  GUI so the tool rules live in exactly one place.
 
 .PARAMETER KeepInf
   Extra INFs to protect from -PruneForeignOemInfs, by filename or bare stem.
@@ -89,9 +89,9 @@
 
 .PARAMETER SourceExePath
   Path to a downloaded NVIDIA driver installer .exe (a self-extracting 7z archive). Mutually
-  exclusive with -SourcePackagePath. Unpacking needs a 7z-compatible CLI for the fast route, or
-  nothing at all: with no 7-Zip installed the pipeline falls back to NVIDIA's own installer
-  (`setup.exe -x -s`), which expands the package without installing it. See Unpack-DriverExe.ps1.
+  exclusive with -SourcePackagePath. Unpacking it needs a 7z-compatible CLI - 7-Zip, NanaZip or any
+  7z on PATH - and the run stops and says how to install one when none is present. See
+  Unpack-DriverExe.ps1.
 
 .PARAMETER SourcePackagePath
   Root of an ALREADY-UNPACKED stock NVIDIA driver package (must contain setup.exe, setup.cfg,
@@ -189,7 +189,12 @@ param(
     [switch]$KeepAllOldCerts,
 
     [string]$SignToolPath,
-    [string]$Inf2CatPath
+    [string]$Inf2CatPath,
+
+    # Use this 7z-compatible CLI instead of looking for one. It is a hard request in both places it
+    # matters: the preflight names that file, and the unpack step is handed the same one, so a
+    # machine with more than one 7z install cannot report one and then extract with another.
+    [string]$SevenZipPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -215,6 +220,12 @@ if (-not $WhitelistPath) {
 # not set this variable at all.
 if (-not $PfxPassword -and $env:DRIVER_PATCH_PFX_PASSWORD) {
     $PfxPassword = ConvertTo-SecureString $env:DRIVER_PATCH_PFX_PASSWORD -AsPlainText -Force
+    # Gone again the moment it has become a SecureString. A process's environment block is readable
+    # by anything else running as this user, and a run that takes half an hour of catalog building
+    # would otherwise hold a plaintext password in it that nothing downstream ever reads again -
+    # downstream gets $PfxPassword. Clearing here is safe for the same reason: this is the child
+    # process the GUI started with the variable set, not the GUI itself.
+    Remove-Item Env:DRIVER_PATCH_PFX_PASSWORD -ErrorAction SilentlyContinue
 }
 
 # --- Is this machine's GPU one this toolkit unlocks? -------------------------------------------
@@ -249,19 +260,20 @@ if ($CheckLocalGpuSupport) {
 
 if ($CheckPatchTools) {
     # The same discovery the preflight uses, so the GUI's answer and the run's behaviour cannot
-    # drift apart. Inf2Cat/signtool are hard requirements with no substitute; 7-Zip is not,
-    # because NVIDIA's own installer covers unpacking when it is absent.
-    $inf2cat  = $null; $signtool = $null; $seven = $null; $setup = $null
+    # drift apart. All three are hard requirements now, each for its own reason: Inf2Cat is the only
+    # tool that can rebuild nv_disp.cat after the INFs are edited, signtool is the only thing that
+    # can sign what it rebuilds, and a 7z-compatible CLI is the only thing that unpacks the download
+    # this toolkit starts from. Each one that is missing gets its install command printed below.
+    $inf2cat  = $null; $signtool = $null; $seven = $null
     $missingHard = @()
     try { $inf2cat  = Find-WdkTool -ExeName 'Inf2Cat.exe' }  catch { $missingHard += 'Inf2Cat.exe' }
     try { $signtool = Find-WdkTool -ExeName 'signtool.exe' } catch { $missingHard += 'signtool.exe' }
-    try { $seven = Find-SevenZip } catch { $seven = $null }
-    if (-not $seven) { $setup = Find-NvidiaSetupExe }
+    try { $seven = Find-SevenZip } catch { $seven = $null; $missingHard += '7z' }
 
     if ($missingHard.Count -gt 0) { Write-Output 'TOOLS_MISSING' } else { Write-Output 'TOOLS_OK' }
     Write-Output ("  Inf2Cat:  " + $(if ($inf2cat) { $inf2cat } else { 'NOT FOUND' }))
     Write-Output ("  signtool: " + $(if ($signtool) { $signtool } else { 'NOT FOUND' }))
-    Write-Output ("  7z:       " + $(if ($seven) { $seven } elseif ($setup) { 'not installed - unpacking via NVIDIA installer' } else { 'not installed - no unpack fallback found on this machine' }))
+    Write-Output ("  7z:       " + $(if ($seven) { $seven } else { 'NOT FOUND' }))
     foreach ($m in $missingHard) {
         foreach ($h in (Get-MissingToolHelp -ToolNames @($m))) { Write-Output $h }
     }
@@ -276,13 +288,6 @@ Examples:
   .\Invoke-DriverPatchPipeline.ps1 -SourceExePath "C:\Downloads\610.88-desktop-...-whql.exe"
   .\Invoke-DriverPatchPipeline.ps1 -SourcePackagePath "C:\NVIDIA\610.88-desktop-...-whql"
 "@
-}
-
-function Test-DriverPackageRoot {
-    param([string]$Path)
-    (Test-Path (Join-Path $Path "setup.exe")) -and
-    (Test-Path (Join-Path $Path "setup.cfg")) -and
-    (Test-Path (Join-Path $Path "Display.Driver"))
 }
 
 # A universal build stays "<source>_Patched", exactly as before, which also keeps every folder
@@ -377,16 +382,11 @@ What you probably want instead:
 # surfaced after a multi-GB extraction/copy had already been paid for.
 Write-Host "Preflight: checking tools and signing identity..." -ForegroundColor DarkGray
 
-$tools = Assert-PatchTools -NeedSevenZip:$usingExe -Inf2CatPath $Inf2CatPath -SignToolPath $SignToolPath
+$tools = Assert-PatchTools -NeedSevenZip:$usingExe -SevenZipPath $SevenZipPath -Inf2CatPath $Inf2CatPath -SignToolPath $SignToolPath
+# Assert-PatchTools already threw if no 7z-compatible CLI could be found and the source is a .exe,
+# so by here the CLI is known and this line is only the machine telling you which one it picked.
 if ($usingExe) {
-    if ($tools.SevenZip) {
-        Write-Host "  7z:       $($tools.SevenZip)" -ForegroundColor DarkGray
-    }
-    else {
-        Write-Host "  7z:       none found - unpacking via NVIDIA's installer (setup.exe -x -s) instead" -ForegroundColor DarkGray
-        Write-Host "            slower, and needs the download on this machine; install 7-Zip for the" -ForegroundColor DarkGray
-        Write-Host "            fast route:  winget install -e --id 7zip.7zip" -ForegroundColor DarkGray
-    }
+    Write-Host "  7z:       $($tools.SevenZip)" -ForegroundColor DarkGray
 }
 Write-Host "  Inf2Cat:  $($tools.Inf2Cat)" -ForegroundColor DarkGray
 Write-Host "  signtool: $($tools.SignTool)" -ForegroundColor DarkGray
@@ -466,7 +466,7 @@ function Step-Banner {
 
 if ($usingExe) {
     Step-Banner "Unpacking installer"
-    & (Join-Path $PSScriptRoot "Unpack-DriverExe.ps1") -ExePath $SourceExePath -OutputPath $OutputPath
+    & (Join-Path $PSScriptRoot "Unpack-DriverExe.ps1") -ExePath $SourceExePath -OutputPath $OutputPath -SevenZipPath $tools.SevenZip
 }
 else {
     Step-Banner "Copying package"

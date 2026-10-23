@@ -39,6 +39,107 @@ mode on - see [Trusting the certificate](#trusting-the-certificate).
 subsystem ID, description, and a captured INF section body to use as a template), originally
 derived by diffing a stock `Original_Nvidia_595.79...` package against a hand-patched one.
 
+The toolkit needs two things installed on the machine: a 7z-compatible CLI (7-Zip or NanaZip) to
+unpack the driver download, and the Windows SDK for `Inf2Cat.exe` and `signtool.exe`. Everything
+else is already in Windows, and everything is checked before a run starts - see
+[Dependencies](#dependencies).
+
+## Dependencies
+
+Everything the toolkit needs, in one place. Two things have to be installed; the rest of it is
+already in Windows 10/11. Nothing here needs internet access to *run* - signing reaches the network
+once for an RFC3161 timestamp, and that is best-effort: an unreachable timestamp server leaves the
+catalog signed and the run continuing with a warning, and `-SkipTimestamp` skips the attempt
+entirely. The one place this toolkit points at the internet is what happens when a dependency is
+missing: the refused-run window can open that tool's download page for you (see
+[GUI](#the-graphical-interface)), which is your browser asking for internet, not the patcher.
+
+**Install these two**
+
+| Dependency | What it is for | Install |
+|---|---|---|
+| **7-Zip** (or NanaZip - any 7z-compatible CLI) | Unpacks the driver download. It is the only route. See [Unpacking a driver .exe](#unpacking-a-driver-exe). | <https://7-zip.org/> - or `winget install -e --id 7zip.7zip` from a terminal |
+| **Windows SDK**, with **Windows SDK Signing Tools** and **Windows Driver Kit** kept selected - it is the WDK's *Binaries* feature that carries `Inf2Cat.exe` | `Inf2Cat.exe` rebuilds `nv_disp.cat` after the INFs are edited, `signtool.exe` signs what it rebuilds. Neither has a substitute, and nothing else in the SDK is ever run here. A full Windows Driver Kit development environment is **not** needed - those two SDK features are enough. | <https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/> |
+
+Both are resolved automatically before a run starts: the scripts call that a preflight
+(`-CheckPatchTools`), the GUI asks the same question before unpacking anything, and a missing one
+stops the run with the install command in the message instead of failing halfway through.
+`Inf2Cat.exe` and `signtool.exe` are looked for under `%WDKContentRoot%` and
+`Windows Kits\10\bin` (newest SDK version first, x64 preferred — `Inf2Cat.exe` ships x86-only) and
+then on `PATH`, and can be named directly with `-Inf2CatPath` / `-SignToolPath`. A 7z CLI is looked
+for via the WindowsApps `7z.exe` alias, `Program Files\7-Zip`, `Program Files (x86)\7-Zip`,
+`Program Files\NanaZip` and then `PATH`, and can be named with `-SevenZipPath`.
+
+Two files have to exist for a run to work, and they come from two features of the SDK install:
+`signtool.exe` from **Windows SDK Signing Tools**, and `Inf2Cat.exe` from the **Windows Driver Kit**
+content - its *Binaries* feature is the one that carries the tool. Headers, libs, debuggers,
+extension SDKs and the rest of what the SDK installer offers are never executed by anything in this
+toolkit. On the machine every verified release here was measured on, `Windows Driver Kit`
+10.1.28000.2526 sits on top of `Windows SDK` 10.1.28000.2705; the two version numbers differ in
+their last digits and that is not a problem, because both put their tools into the same
+`Windows Kits\10\bin\10.0.28000.0` tree, and that is where the lookup finds them. `%WDKContentRoot%`
+is empty on that machine too - the variable belongs to the WDK's own shell environment, not to a
+tool being run from PowerShell - so no environment setup is needed for the patcher, and the fallback
+search path is the one in use. Ask your own machine what it has:
+`.\Scripts\Invoke-DriverPatchPipeline.ps1 -CheckPatchTools` prints the full path of each tool, or
+says which one is missing and how to install it.
+
+### Unpacking a driver .exe
+
+`Unpack-DriverExe.ps1` expands the download with a 7z-compatible CLI and with nothing else, and it
+does it in seconds. A machine without one stops there and is told what to install. Point
+`-SourcePackagePath` at a folder you unpacked by hand and no CLI is needed at all.
+
+**Already in Windows 10/11 — nothing to install**
+
+- **Windows PowerShell 5.1** (`powershell.exe`) — every `.ps1` here targets it specifically, not
+  PowerShell 7+. Two of its quirks are worked around: `$PSScriptRoot` is empty inside a `param()`
+  default when a script is launched via `-File`, and `Read-Host -AsSecureString` does not work over
+  a redirected stdin pipe. PS 7 is deliberately **not** a dependency (no PS 7-only syntax is used)
+  and the test suite runs on 5.1 and 7 alike.
+- **.NET Framework 4.x** — `Chameleon-Patcher.exe` is a compiled WinForms app; the runtime is
+  present on any normal Windows 10/11 install.
+- **`certutil.exe`** — used by `Approve-DriverPatchCert.ps1` and by the `GpuUnlockCert.nvi`
+  installer component.
+- **The PKI module** (`New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate`)
+  — used by `New-DriverSigningCert.ps1`.
+- **`Get-CimInstance`** — `PatchToolDiscovery.ps1` reads this machine's GPUs through
+  `Win32_PnPEntity` for the pruning gate.
+
+**To install what this toolkit produces**
+
+- **Test Signing mode**, plus a certificate the machine trusts: the patched package is signed with a
+  self-signed key. See [Trusting the certificate](#trusting-the-certificate).
+- **Administrator rights** — `Approve-DriverPatchCert.ps1` (`certutil -addstore`) and running
+  `setup.exe` both need them.
+- **A driver to patch** — a real NVIDIA download (`.exe` or already-unpacked package). The project
+  bundles neither.
+
+**Only needed to rebuild the GUI** (after editing `Source\Chameleon-Patcher.cs`): `csc.exe`, at
+`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`, invoked by `Source\Build.ps1`. That is in
+Windows already, so rebuilding needs no install either — see [GUI](#gui).
+
+**Internal dependencies within the project**
+
+- `Invoke-DriverPatchPipeline.ps1` is the orchestrator: it calls the other scripts in sequence, and
+  it is the only script `Chameleon-Patcher.exe` invokes.
+- `Add-ExtraGpuSupport.ps1` needs `whitelist.json`.
+- `Add-SetupCertOption.ps1` needs `templates\GpuUnlockCert.nvi.template`.
+- `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1` and the certificate generation all work
+  on `Certificates\DriverPatchSigning_<thumbprint>.cer` (and `.pfx` when you asked for one), and all
+  three pick the certificate through one shared routine in `PatchToolDiscovery.ps1` so they cannot
+  disagree about which one it is. `Sign-DriverPackage.ps1` reads only the **public** `.cer` to learn
+  the thumbprint to sign with; the `.pfx` is touched on the fallback path only.
+- `Invoke-DriverPatchPipeline.ps1`, `Unpack-DriverExe.ps1` and `Sign-DriverPackage.ps1` dot-source
+  `PatchToolDiscovery.ps1`.
+
+**Expect the catalog rebuild to dominate the runtime.** `Inf2Cat.exe` is a single-threaded 32-bit
+tool that re-validates the whole `Display.Driver` folder once per INF, and a real package has ~43
+INFs over ~2.7 GB, so the "Rebuilding + signing catalog" step (7 of 9 in a default run, and one
+lower each time you start from an already-unpacked folder or pass a `-Skip...` switch) can run for
+tens of minutes at 100% of one core while every other step finishes in seconds. Nothing is wrong
+when it appears to sit on `Processing INF:` for a long time.
+
 ## Project layout
 
 ```
@@ -72,11 +173,14 @@ Chameleon_Project\
 │  └─ templates\GpuUnlockCert.nvi.template
 ├─ Tests\                   <- Pester tests for the INF text handling; run: Invoke-Pester Tests
 │  ├─ PatchToolDiscovery.Tests.ps1
-│  └─ InfPatchIntegrity.Tests.ps1
+│  ├─ InfPatchIntegrity.Tests.ps1
+│  ├─ ExtraGpuSectionPlacement.Tests.ps1
+│  └─ ForeignOemPrune.Tests.ps1
 └─ Certificates\            <- created automatically the first time a cert is needed
    ├─ DriverPatchSigning_<thumbprint>.cer  <- public cert, one file per minted certificate
    ├─ DriverPatchSigning.cer   <- legacy fixed name (versions before 1.0.2); still honoured
-   └─ DriverPatchSigning.pfx   <- only if you asked for one (-Exportable)
+   └─ DriverPatchSigning_<thumbprint>.pfx  <- only if you asked for one (-Exportable)
+      (the legacy fixed name is still honoured as an input; it is no longer written)
 ```
 
 `Certificates\` doesn't need to exist ahead of time - `New-DriverSigningCert.ps1` and
@@ -97,29 +201,31 @@ script that regenerates the `.ico` and `.png` from it.
 | `Source\Chameleon-Patcher.cs` | The GUI's source. Version attributes sit at the top of the file and are the single place the release number is declared - see [Version](#version). |
 | `Source\Build.ps1` | Rebuilds the `.exe` into the project root with `csc.exe` and prints the version resource it produced. |
 | `Scripts\Invoke-DriverPatchPipeline.ps1` | All-in-one: unpack → patch → sign → add the installer checkbox, and prune old signing keys from `Cert:\CurrentUser\My` (see `-KeepAllOldCerts`). Takes either a raw downloaded `.exe` or an already-unpacked folder; result is always a plain folder. |
-| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder. Prefers a 7z-compatible CLI; with none installed it falls back to NVIDIA's own installer (`setup.exe -x -s`), so 7-Zip is not a hard requirement. See [Dependencies](#dependencies). Both places where the installer route picks a folder out of `C:\NVIDIA\DisplayDriver\` ask for the version the requested `.exe` names, and the expansion is then re-checked against it, because an older folder left there - or one whose timestamp moved for an unrelated reason - used to be copied, patched, verified and signed as though it were the download you asked for. |
+| `Scripts\Unpack-DriverExe.ps1` | Extracts a downloaded driver `.exe` (a 7-Zip SFX) into a plain folder using a 7z-compatible CLI - 7-Zip, NanaZip, or any `7z` on `PATH`. That is the only route: a machine without one is stopped and told what to install. |
 | `Scripts\Add-ExtraGpuSupport.ps1` | Applies `whitelist.json` to a stock `Display.Driver` folder. Does not hardcode section numbers, so it survives INF renumbering between releases, and resolves INF *filenames* by stem so it survives them being renamed too — see [When NVIDIA renames the INFs](#when-nvidia-renames-the-infs). Written for any driver version; only the releases in [Verified driver releases](#verified-driver-releases) have been run end to end. |
 | `Scripts\Add-RmCapabilityOverride.ps1` | Adds the `RM1457588` registry override to every `nv_miscBase_addreg__*` section in every driver INF - fixes VRAM size misreporting and broken compute on whitelisted GPUs. See [below](#why-vram-size--compute-needs-a-second-fix). |
-| `Scripts\Remove-ForeignOemInfs.ps1` | Drops the OEM display INFs that cannot match this machine, taking the catalog rebuild from ~50 min to ~7. Opt-in via `-PruneForeignOemInfs`. See [Making a run finish in minutes](#making-a-run-finish-in-minutes-instead-of-an-hour). |
+| `Scripts\Remove-ForeignOemInfs.ps1` | Drops the OEM display INFs that cannot match this machine, taking the catalog rebuild from ~50 min to ~7. Opt-in via `-PruneForeignOemInfs`. The catalog and filter files that share a pruned INF's stem stay where they are, manifest entry included, and the step says so rather than deciding for you. See [Making a run finish in minutes](#making-a-run-finish-in-minutes-instead-of-an-hour). |
 | `Scripts\Enable-OptionalComponents.ps1` | Makes PhysX and the NVIDIA App offered for the unlocked GPUs, and the NVIDIA App unticked-able. See [PhysX and the NVIDIA App](#physx-and-the-nvidia-app). |
 | `Scripts\Test-DriverPatch.ps1` | Verifies a package really was patched, and is run **before signing** so a silently-unpatched package can't be signed and shipped as finished. See [The verification gate](#the-verification-gate). Also runnable standalone against any package. |
-| `Scripts\New-DriverSigningCert.ps1` | Generates a fresh, locally-owned self-signed code-signing cert (does **not** touch system trust stores). The key is **non-exportable** and stays in `Cert:\CurrentUser\My`, so there is no `.pfx` and no password at all. `-Exportable` opts into a portable `.pfx`. Defaults to a 3-year life. |
-| `Scripts\Sign-DriverPackage.ps1` | Rebuilds `nv_disp.cat` from the patched INFs (`Inf2Cat.exe`) and signs it (`signtool.exe`) with your cert. Signs **without any password** when the key is in your certificate store — see [Signing without a password](#signing-without-a-password). |
-| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, NVIDIA's `setup.exe`, `Inf2Cat.exe`, `signtool.exe`) and the install guidance shown when one is missing, dot-sourced by the others. The pipeline uses it to check every tool up front, so a missing SDK fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. It also owns the INF text primitives every writer inserts through: `Get-InfSectionIndex` decides where a new line lands inside a section, the shared `[section]` header pattern keeps the patchers and the gate reading sections the same way, `Test-InfLineContinuations` reports trailing-backslash continuations, and the driver-version parsing sits behind the unpack guard. |
+| `Scripts\New-DriverSigningCert.ps1` | Generates a fresh, locally-owned self-signed code-signing cert (does **not** touch system trust stores). The key is **non-exportable** and stays in `Cert:\CurrentUser\My`, so there is no `.pfx` and no password at all. `-Exportable` opts into a portable `.pfx`. Defaults to a 3-year life. It will not overwrite a `.cer` or `.pfx` that already exists, and it will not mint a second valid certificate under a subject already in the store unless you pass `-Force` - see [Renaming the certificate](#renaming-the-certificate). |
+| `Scripts\Sign-DriverPackage.ps1` | Rebuilds `nv_disp.cat` from the patched INFs (`Inf2Cat.exe`) and signs it (`signtool.exe`) with your cert. Signs **without any password** when the key is in your certificate store — see [Signing without a password](#signing-without-a-password). Only the catalogs Inf2Cat actually (re)built get signed: a `.cat` with no INF of the same name left in the folder is a leftover of an earlier run, and it is named and left unsigned instead of being dressed up as current. |
+| `Scripts\PatchToolDiscovery.ps1` | Shared lookup for the external tools (7-Zip/NanaZip, `Inf2Cat.exe`, `signtool.exe`) and for the install guidance shown when one is missing, dot-sourced by the others. The pipeline resolves all three before copying anything, so a missing SDK or a missing 7-Zip fails in seconds instead of after a multi-GB copy. Also owns the routines every script must agree on: GPU detection (prune step, output-folder tag, pruned-build gate), signing-certificate resolution (pipeline, `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`), INF device-line matching (patcher, prune step, optional components, verification gate), and the `Remove-OldDriverPatchCerts` cleanup of old signing keys. It also owns the INF text primitives every writer inserts through: `Get-InfSectionIndex` decides where a new line lands inside a section, the shared `[section]` header pattern keeps the patchers and the gate reading sections the same way, and `Test-InfLineContinuations` reports trailing-backslash continuations. `Test-DriverPackageRoot` is the one test both the unpack step and the pipeline use to decide whether a folder is a driver package. |
 | `Scripts\Add-SetupCertOption.ps1` | Adds a "Chameleon GPU cert." component to `setup.exe`'s Custom Installation Options screen, **ticked by default** and still user-selectable; `-Unchecked` makes it opt-in. Left ticked, it trusts the certificate in `Root` and `TrustedPublisher`, like `Approve-DriverPatchCert.ps1`. The label lives in `templates\GpuUnlockCert.nvi.template`, the same string in every locale. `-ExpectThumbprint` (default: the certificate that actually signs the package's `.cat` files) must match the `.cer` being bound, or the step throws. The checkbox hands whatever it is given to `Root` and `TrustedPublisher`, so this is what keeps an unrelated key out of the machine trust store. |
 | `Scripts\Approve-DriverPatchCert.ps1` | Standalone alternative to the installer checkbox: trusts the cert via a separate, explicit script you run yourself. Adds `Root` (makes the chain work) and `TrustedPublisher` (installs without a device-software prompt). By default it trusts the certificate the pipeline signs with. |
 | `Scripts\Remove-DriverPatchCert.ps1` | The counterpart to the above. Inventories every patch certificate and which stores it sits in, and removes the ones you pick. Read-only until you ask it to delete. See [Cleaning up trusted certificates](#cleaning-up-trusted-certificates). |
 | `Scripts\whitelist.json` | The device/subsystem whitelist data the patcher applies. |
 | `Scripts\templates\GpuUnlockCert.nvi.template` | The verified-working installer-component manifest `Add-SetupCertOption.ps1` copies into each patched package. |
-| `Tests\PatchToolDiscovery.Tests.ps1` | Pester cases for the shared helpers: the section-index walk, device-line matching, `whitelist.json`-to-INF resolution, the certificate thumbprint reader, the driver-version parsing, the two NVIDIA pickers, and the unpack version guard. |
-| `Tests\InfPatchIntegrity.Tests.ps1` | End-to-end cases against a synthetic `Display.Driver` package: the gate refuses it unpatched, the patchers produce a package the gate certifies, insertions land inside the section bodies rather than in the blank gap after them, and a second pass changes nothing. |
+| `Tests\PatchToolDiscovery.Tests.ps1` | Pester cases for the shared helpers: the section-index walk, device-line matching, `whitelist.json`-to-INF resolution, the certificate thumbprint reader, and what a machine with no 7z-compatible CLI is told. |
+| `Tests\InfPatchIntegrity.Tests.ps1` | End-to-end cases against a synthetic `Display.Driver` package: the gate refuses it unpatched, the patchers produce a package the gate certifies, insertions land inside the section bodies rather than in the blank gap after them, a whitelist INF the package does not ship is an error unless the run says it pruned it, and a second pass changes nothing. |
+| `Tests\ExtraGpuSectionPlacement.Tests.ps1` | The insertion rule against the hardest case - a device block that ends the file with a blank tail - plus what the patchers leave behind byte-wise: BOM, line endings and a byte outside UTF-8 all survive a patch. |
+| `Tests\ForeignOemPrune.Tests.ps1` | The prune step: which INFs survive, the keep-everything fallback, what the safety net says about hardware that is present but not installable through the INF it kept, and the manifest's own bytes. |
 | `Certificates\DriverPatchSigning_<thumbprint>.cer` / `.pfx` | Your signing certificate (created on first use). Versions before 1.0.2 wrote a fixed-name `DriverPatchSigning.cer`; both names are honoured. If the folder is deleted, the pipeline finds the key in your certificate store anyway and re-exports the `.cer` - see [Signing without a password](#signing-without-a-password). |
 
-Unpacking a downloaded `.exe` prefers a 7z-compatible CLI - this machine has NanaZip (a 7-Zip-
-compatible Store app), auto-detected via the `7z.exe` WindowsApps alias. A plain 7-Zip install
-under Program Files works too. With neither installed, `Unpack-DriverExe.ps1` expands the package
-through NVIDIA's own installer instead, so 7-Zip is a speed option, not a requirement. The one
-dependency you must install is the Windows SDK - see [Dependencies](#dependencies).
+Unpacking a downloaded `.exe` is done by a 7z-compatible CLI - this machine has NanaZip (a
+7-Zip-compatible Store app), auto-detected through the `7z.exe` WindowsApps alias, and a plain
+7-Zip install under Program Files is found the same way. With neither installed the run stops and
+prints the command that installs one, so 7-Zip is a requirement rather than a speed option. The
+other dependency you must install is the Windows SDK - see [Dependencies](#dependencies).
 
 ## GUI
 
@@ -143,8 +249,9 @@ It passes `-NonInteractive`, because the child has no attached console and any p
 with the GUI showing no reason why (`Read-Host -AsSecureString` does not reliably read from a
 redirected stdin pipe without a real console). With `-NonInteractive` the pipeline turns any
 would-be prompt into a clear error that appears in the log instead. In the normal store-signing
-case no password is involved at all. If you do type one, it travels in an environment variable
-set only on the child process (`$env:DRIVER_PATCH_PFX_PASSWORD`), never as a command-line argument.
+case no password is involved at all. If you do type one, it travels in an environment variable set
+on the child's own environment block (`$env:DRIVER_PATCH_PFX_PASSWORD` there, removed from the
+pipeline's own once the child has started), never as a command-line argument.
 
 The GUI spots that particular error by looking for the phrase `none was supplied and prompting is
 disabled` in the child's output, and then offers the `Import-PfxCertificate` line that fixes it
@@ -159,12 +266,22 @@ pruning for](#a-pruned-build-needs-a-gpu-worth-pruning-for). Answering yes untic
 log header and the output folder name both reflect what was actually built.
 
 Before a run starts, the GUI asks the pipeline which external tools this machine can resolve
-(`-CheckPatchTools`) and refuses to begin if `Inf2Cat` or `signtool` is missing - the two
-dependencies with no substitute. The dialog names each missing tool and carries its install
-command, and says plainly that nothing has been unpacked and nothing was changed. That check exists
-because the catalog rebuild is the step that takes tens of minutes: finding out the SDK is absent
-after a multi-GB unpack is the expensive order. A missing 7-Zip is **not** a refusal - the status
-line notes that unpacking will go through NVIDIA's installer and be slower, and the run proceeds.
+(`-CheckPatchTools`) and refuses to begin when any of the three is missing: `Inf2Cat.exe` and
+`signtool.exe` have no substitute, and a 7z-compatible CLI is what unpacks the driver download.
+The dialog names each missing tool, points at the page that installs it, and says plainly that nothing
+has been unpacked and nothing was changed. It is laid out like the message box it replaced - error
+icon, system font, buttons bottom right - with the message as plain text, plus one button a message
+box cannot carry: **Open the 7-Zip download page**, **Open the Windows SDK download page**, or
+**Open both download pages** when both are needed, and it opens the page in the default browser - so
+that one convenience needs internet access, while the patching itself does not. It is a button, not a
+requirement: close the window and install whatever is missing any way you like. The console answer to
+the same question (`-CheckPatchTools`, and the message a script throws) keeps the `winget` command as
+well, because whoever is already in a terminal can use it. When
+both
+SDK tools are missing they are described once, as one package to fetch. That check exists because
+the catalog rebuild is the step
+that takes tens of minutes - finding out the SDK is absent after a multi-GB unpack is the expensive
+order. Once the tools are there, the status line says which 7z CLI the run will unpack with.
 See [Dependencies](#dependencies).
 
 An unexpected error is recorded, not swallowed. `AppDomain.UnhandledException` and
@@ -182,8 +299,8 @@ box is unticked anything left in those fields is ignored, and unticking it clear
 Starting a run with the box ticked but the `.pfx` file or its password missing stops before
 anything runs and offers either to go back and fill them in or to untick the box and sign the
 normal way. If a run stops because the key is not on this PC and a `.pfx` password is needed, the
-GUI shows the fields, fills in `Certificates\DriverPatchSigning.pfx` if that exists, and says what
-to enter. See [Signing without a password](#signing-without-a-password).
+GUI shows the fields and fills in the newest `Certificates\DriverPatchSigning*.pfx` in that folder -
+the exports are named after the certificate's thumbprint - and says what to enter. See [Signing without a password](#signing-without-a-password).
 
 It's a self-contained `.exe` compiled from `Source\Chameleon-Patcher.cs` via the .NET Framework's
 built-in `csc.exe` (no external tools, no internet needed) - rebuild after editing the source with:
@@ -213,8 +330,8 @@ The version is declared once, as assembly attributes at the top of `Source\Chame
 
 ```csharp
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.4.0")]
-[assembly: AssemblyInformationalVersion("1.0.4")]
+[assembly: AssemblyFileVersion("1.0.5.0")]
+[assembly: AssemblyInformationalVersion("1.0.5")]
 ```
 
 Everything else reads that one declaration back, so the number appears in three places and cannot
@@ -223,7 +340,7 @@ drift between them:
 **1. The window title bar**, which is the quickest check and makes a screenshot self-identifying:
 
 ```
-Chameleon Patcher 1.0.4
+Chameleon Patcher 1.0.5
 ```
 
 **2. The file's Win32 version resource.** `csc.exe` folds the attributes in by itself - there is no
@@ -238,8 +355,8 @@ literal, so a log and the binary that wrote it cannot disagree:
 
 ```
 === Chameleon Patcher - patch log ===
-started        : 2026-09-11 10:41:02 +02:00
-version        : 1.0.4
+started        : 2026-10-23 09:12:44 +02:00
+version        : 1.0.5
 ```
 
 The log line matters because a patched driver package carries no trace of which build of this tool
@@ -253,8 +370,10 @@ at start time. A run is therefore identified by the version **plus** the revisio
 next to the `.exe`. A `.exe` sitting in a working tree whose scripts have moved on since the last
 release stamps an older number over newer behaviour, so a bug report quoting it can point at the
 wrong code. Before treating a version in a log as the whole truth, check it against
-[CHANGELOG.md](CHANGELOG.md): if the tree has an `Unreleased` section, the scripts were changed
-after that number was built. Cutting a release means a `CHANGELOG.md` heading with a date, the
+[CHANGELOG.md](CHANGELOG.md): the newest dated heading is the number a log should match, and anything
+committed after that heading - including anything parked under the `Unreleased` heading a release cut
+leaves empty - is newer than the number the log carries. Cutting a release means a `CHANGELOG.md`
+heading with a date, the
 bumped attributes, a rebuild with `Source\Build.ps1`, and the rebuilt `.exe` committed in the same
 commit as the scripts it runs against.
 
@@ -295,112 +414,6 @@ lives in the GUI wrapper. Redirect the script's output instead:
 .\Scripts\Invoke-DriverPatchPipeline.ps1 -SourceExePath "...exe" *> patch.log
 ```
 
-## Dependencies
-
-Designed for the lowest possible bar: everything below is either already in Windows 11, or is
-auto-detected by the scripts. Nothing here needs internet access to install, and nothing needs
-PowerShell 7, .NET 8, an SDK for the GUI, or a package manager.
-
-Signing does reach the network once, for an RFC3161 timestamp, but that is best-effort: if the
-timestamp server is unreachable the catalog is still signed and the run continues with a warning.
-`-SkipTimestamp` skips the attempt entirely, making the whole pipeline fully offline-capable.
-
-**Already in Windows 11 — nothing to install**
-- **Windows PowerShell 5.1** (`powershell.exe`) - every `.ps1` script targets this specifically,
-  not PowerShell 7+. The scripts work around two of its quirks: `$PSScriptRoot` is empty inside a
-  `param()` default value when a script is launched via `-File`, and `Read-Host -AsSecureString`
-  doesn't work over a redirected stdin pipe. PS 7 is deliberately **not** a dependency: it is an
-  optional install, and requiring it would raise the bar for no benefit — the code uses no PS 7-only
-  syntax.
-- **.NET Framework 4.x** - `Chameleon-Patcher.exe` is a compiled WinForms app; needs the .NET
-  Framework runtime (present on any normal Windows 10/11 install) to run at all.
-- **`certutil.exe`** - used by `Approve-DriverPatchCert.ps1` and by the `GpuUnlockCert.nvi`
-  installer component. Built into Windows.
-- **The PKI module** (`New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate`)
-  - used by `New-DriverSigningCert.ps1`. Ships with Windows.
-- **`Get-CimInstance`** - `PatchToolDiscovery.ps1` reads this machine's GPUs through
-  `Win32_PnPEntity` for the pruning gate. Built into Windows.
-
-**The one thing you install: the Windows SDK**
-
-`Inf2Cat.exe` and `signtool.exe` are the only dependencies that are not in Windows, and they are
-the only ones with no substitute: editing the INFs invalidates `nv_disp.cat`, and `Inf2Cat` is the
-only tool that rebuilds it.
-
-A **full Windows Driver Kit is not needed** — the Windows SDK alone is enough. On the machine
-these runs were measured on, `Inf2Cat.exe` comes from the SDK's **Windows Driver Kit** feature and
-`signtool.exe` from **Windows SDK Signing Tools**; both are features of the Windows SDK, not of a
-separate WDK install. Install the SDK from Microsoft's download page and keep those two features
-selected:
-
-<https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/>
-
-`PatchToolDiscovery.ps1` finds both: it searches `%WDKContentRoot%` and `Windows Kits\10\bin`,
-picking the newest SDK version and, within it, the x64 build (`Inf2Cat.exe` ships x86-only;
-`signtool.exe` ships x86/x64/arm64), then falls back to `PATH`. Override with `-Inf2CatPath` /
-`-SignToolPath`. The pipeline resolves both **before** copying anything, so a missing SDK fails in
-seconds — not after a multi-GB unpack. The GUI asks the same question before it starts and shows
-the install guidance above.
-
-**7-Zip is optional**
-
-Unpacking a driver `.exe` has two routes, and `Unpack-DriverExe.ps1` picks between them:
-
-1. **A 7z-compatible CLI (NanaZip, 7-Zip)** — the preferred route. Extracts straight into the
-   folder you name, in one step, running nothing. Found via the WindowsApps `7z.exe` alias, then
-   `Program Files\7-Zip`, then `Program Files (x86)\7-Zip`, then `Program Files\NanaZip`, then
-   `PATH`.
-2. **NVIDIA's own installer, `setup.exe -x -s`** — the no-install fallback. Expands the package
-   without installing a driver, so a machine with nothing third-party installed can still patch a
-   download. It is slower, and it expands to NVIDIA's fixed location under the volume root
-   (`C:\NVIDIA\DisplayDriver\<version>\<os>\Current`) rather than to a path you choose, so the
-   result is copied into the output folder afterwards. It runs the downloaded installer, so it
-   needs the download to be on — and runnable on — this machine.
-
-Point `-SourcePackagePath` at an already-unpacked folder and neither route runs at all.
-
-**External tools each script shells out to**
-
-| Tool | Used by | How it's found |
-|---|---|---|
-| `Inf2Cat.exe` + `signtool.exe` (Windows SDK) | `Sign-DriverPackage.ps1` | `%WDKContentRoot%`, then `Program Files (x86)\Windows Kits\10\bin`, then `Program Files\Windows Kits\10\bin` (each newest version first, x64 preferred), then `PATH`. **Required — no fallback.** |
-| A 7z-compatible CLI (NanaZip or 7-Zip) | `Unpack-DriverExe.ps1` | WindowsApps alias, `Program Files\7-Zip`, `Program Files (x86)\7-Zip`, `Program Files\NanaZip`, then `PATH`. **Optional** — falls back to NVIDIA's installer. |
-| NVIDIA's `setup.exe` | `Unpack-DriverExe.ps1` (fallback route) | `C:\NVIDIA\DisplayDriver`, then the `NVIDIA Display Operation Server` temp folder. |
-| `certutil.exe` (built into Windows) | `Approve-DriverPatchCert.ps1`, and the `GpuUnlockCert.nvi` installer component | Always present on Windows |
-| `New-SelfSignedCertificate` / `Export-Certificate` / `Export-PfxCertificate` (PKI module, built-in) | `New-DriverSigningCert.ps1` | Ships with Windows, no install needed |
-
-**Build-time only** (not needed to *run* the toolkit, only to *rebuild* the GUI after editing
-`Source\Chameleon-Patcher.cs`): `csc.exe` at
-`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`, invoked by `Source\Build.ps1` (see
-[GUI](#gui) above). That is in Windows already, so rebuilding needs no install either.
-
-**Internal dependencies within the project**
-- `Invoke-DriverPatchPipeline.ps1` is the orchestrator - it calls all the other scripts in
-  sequence, and is the only script `Chameleon-Patcher.exe` itself invokes.
-- `Add-ExtraGpuSupport.ps1` needs `whitelist.json`.
-- `Add-SetupCertOption.ps1` needs `templates\GpuUnlockCert.nvi.template`.
-- `Sign-DriverPackage.ps1`, `Approve-DriverPatchCert.ps1`, and the cert-generation step all
-  read/write `Certificates\DriverPatchSigning_<thumbprint>.cer` (and `.pfx` if you asked for one).
-  They pick the certificate through one shared routine in `PatchToolDiscovery.ps1`, so all three
-  agree on which one it is. `Sign-DriverPackage.ps1` only reads the **public** `.cer`, to learn
-  which thumbprint to sign with; the `.pfx` is touched solely on the fallback path.
-- `Invoke-DriverPatchPipeline.ps1` and `Sign-DriverPackage.ps1` both dot-source
-  `PatchToolDiscovery.ps1` for tool lookup and signing-identity resolution.
-
-**Expect the catalog rebuild to dominate the runtime.** `Inf2Cat.exe` is a single-threaded 32-bit
-tool that re-validates the whole `Display.Driver` folder once per INF, and a real package has ~43
-INFs over ~2.7 GB, so the "Rebuilding + signing catalog" step (7 of 9 in a default run, and one
-lower each time you start from an already-unpacked folder or pass a `-Skip...` switch) can run
-for tens of minutes at 100% of one core while every other
-step finishes in seconds. Nothing is wrong when it appears to sit on `Processing INF:` for a long
-time.
-
-**Other requirements**
-- **Administrator rights** - needed for `Approve-DriverPatchCert.ps1` (`certutil -addstore`) and
-  for actually running `setup.exe` to install a driver.
-- **Input**: a real NVIDIA driver download (`.exe` or unpacked folder) to patch - the project
-  doesn't bundle one.
-
 ## Usage (recommended: the all-in-one pipeline)
 
 Point it straight at a downloaded driver `.exe` — this is the normal case:
@@ -409,7 +422,7 @@ Point it straight at a downloaded driver `.exe` — this is the normal case:
 .\Scripts\Invoke-DriverPatchPipeline.ps1 -SourceExePath "D:\Downloads\610.88-desktop-win10-win11-64bit-international-dch-whql.exe"
 ```
 
-One command: unpacks the installer (never touches the source `.exe`), applies the
+One command: unpacks the download (never touches the source `.exe`), applies the
 device/subsystem whitelist, applies the RM capability override, **verifies the patches actually
 applied**, reuses (or first generates) a signing cert, rebuilds and signs `nv_disp.cat`, and adds
 the "Chameleon GPU cert." installer checkbox, ticked by default (`-SkipSetupCertOption` leaves it
@@ -432,12 +445,28 @@ Preflight: checking tools and signing identity...
   cert:     2A4A4A0C6666E4CD1E59E04CBF4EAFCB06843EA8 (from certificate store - no password needed)
 ```
 
-With no 7-Zip installed, the `7z:` line says so and names the fallback route instead of a path:
+A machine with no 7z-compatible CLI gets a different answer, and nothing is unpacked:
 
 ```
-  7z:       none found - unpacking via NVIDIA's installer (setup.exe -x -s) instead
-            slower, and needs the download on this machine; install 7-Zip for the
-            fast route:  winget install -e --id 7zip.7zip
+TOOLS_MISSING
+  Inf2Cat:  C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x86\Inf2Cat.exe
+  signtool: C:\Program Files (x86)\Windows Kits\10\bin\10.0.28000.0\x64\signtool.exe
+  7z:       NOT FOUND
+
+A 7z-compatible CLI is required to unpack a driver .exe, and none is installed. 7-Zip is free and
+lives on its own download page:
+
+    https://7-zip.org/
+
+    From a terminal, the same install is:
+        winget install -e --id 7zip.7zip
+
+NanaZip, or any 7z-compatible CLI on PATH, is found the same way once it is installed. The other way
+through is -SourcePackagePath: unpack the driver yourself and hand this toolkit the folder it
+produced.
+
+The GUI prints this same guidance without the terminal command, and puts a button next to it that
+opens the address.
 ```
 
 Ask the same question on its own, without patching anything:
@@ -503,15 +532,18 @@ signing, and refuses to continue if anything is wrong. It re-reads the patched I
 - Every `%token%` a device line uses is defined in `[Strings]`.
 - Every `[nv_miscBase_addreg__NN]` section carries the `RM1457588` override.
 
-Everything on that list except the first half of the first bullet is a hard failure. A whitelist INF
-that has vanished under every name the tiers can reach is reported as a **warning** and the run
-still says `PASSED`, with its entries simply left out of the `N/N` count; that is deliberate,
-because a pruned build legitimately ships without it. It also means a universal build that lost
-`nv_dispi.inf` to a rename nothing can resolve will pass the gate and get signed, with the count
-dropped to `0/0` and the warning on stderr as its only trace. Read the gate's numbers, not just its
-colour. A file that **is** present but has no `[NVIDIA_Devices*]` block at all, and a package with
-no `nv_miscBase_addreg__*` section anywhere, are both hard failures, because either one means the
-INF layout is not what the patcher expects.
+Everything on that list is a hard failure, with one exception worth stating plainly. A whitelist INF
+that has vanished under every name the tiers can reach used to be a **warning**: the run said
+`PASSED` and the entries filed under that key were simply left out of the `N/N` count. Those are the
+entries nobody checked, and they are the ones that decide whether the GPU works, so it is an error
+now. A pruned build is not affected - the pipeline records which whitelist INFs the prune step
+removed and hands them to every step after it as `-PrunedInf`, where they read as the plain note
+they were, and the gate run on its own takes the same switch for the same reason. What the error
+catches is what the warning used to let through: a universal build that lost `nv_dispi.inf` to a
+rename nothing can resolve, passing at `0/0` with one stderr line as its only trace. Read the gate's
+numbers, not just its colour. A file that **is** present but has no `[NVIDIA_Devices*]` block at
+all, and a package with no `nv_miscBase_addreg__*` section anywhere, are both hard failures too,
+because either one means the INF layout is not what the patcher expects.
 
 Run it yourself against any package, patched or not:
 
@@ -565,7 +597,7 @@ means they can be tested without a driver download, a certificate, or a machine 
 result. `Tests\` holds Pester cases for exactly that:
 
 ```powershell
-Invoke-Pester Tests                                # both files
+Invoke-Pester Tests                                # all four files
 Invoke-Pester Tests\InfPatchIntegrity.Tests.ps1    # just the end-to-end one
 ```
 
@@ -573,9 +605,9 @@ Invoke-Pester Tests\InfPatchIntegrity.Tests.ps1    # just the end-to-end one
 walk that decides whether an inserted line lands with the section body or in the blank gap before
 the next header; device-line matching, including a trailing comment and a `&REV_` line that must not
 count as the same hardware ID; `whitelist.json`-to-INF filename resolution across the renames
-releases have used; reading a certificate thumbprint from a `.cer`; and the unpack version guard,
-including the two picks that decide which folder on disk becomes the package: the `setup.exe` of
-the requested version, and the expansion folder whose path names it.
+releases have used; reading a certificate thumbprint from a `.cer`; and what a machine with no
+7z-compatible CLI is told: the run stops and prints where to get one - the download page, and the
+`winget` command for whoever is already in a terminal.
 
 `InfPatchIntegrity.Tests.ps1` builds a small but structurally faithful `Display.Driver` folder in a
 temp directory - two `[NVIDIA_Devices*]` blocks, two `[nv_miscBase_addreg__NN]` sections whose
@@ -590,10 +622,29 @@ that the patched package then passes the gate, and that a second pass of both pa
 file byte-identical. It also checks the INF is still BOM-less UTF-8 with CRLF endings after three
 different writers have opened it.
 
+`ExtraGpuSectionPlacement.Tests.ps1` patches a fixture whose *last* `[NVIDIA_Devices*]` block is the
+one that ends the file, which is the case an insertion rule gets wrong when it treats a section's
+exclusive upper bound as its insertion point, and asserts that every insertion lands inside a
+section. Then it checks what the patchers hand back: a BOM stays a BOM, LF-only line endings stay
+LF-only, a byte that is not valid UTF-8 survives the patch and reads back unchanged - and the RM
+override patcher is held to the same three byte checks. `ForeignOemPrune.Tests.ps1` covers the prune
+step: which INFs survive, what the fallback keeps, what the safety net says about hardware that is
+present but cannot install through the INF it kept, and what the manifest's own bytes look like
+afterwards. Four of its eight cases fail against the previous revision of `Remove-ForeignOemInfs.ps1`,
+which is the point: they pin fixes, not the code as it currently reads.
+
 Pester 3.4 is what ships with PowerShell 5.1, so the files use its syntax and run on 5.1 and 7 - the
 same two interpreters the scripts themselves have to work on. They are worth running before touching
 the section walk or the matching rules, which are the two places where a wrong answer looks exactly
 like a successful patch.
+
+**What is in the tree today is not all of the above.** The `Tests\` folder was lost on the machine the
+1.0.5 work was done on, before any of it was committed. The two files git still carries for `Tests\`
+are the revisions from before 1.0.5, and they exercise helpers that 1.0.5 deleted; the two suites
+written for the changed insertion rule and for the prune step were never committed at all. Running
+`Invoke-Pester Tests` on this tree therefore runs cases that no longer match these scripts, not the
+ones described above. Until they are rebuilt, read this chapter as the specification of what the suite
+is meant to cover rather than as a description of what runs.
 
 ## Verified driver releases
 
@@ -616,9 +667,10 @@ predate the current log format, so their gate numbers are the reported ones, not
 logs are runtime files under `Logs\`, which is git-ignored, so they are not in the repository and
 cannot be checked from a clone.
 
-No end-to-end run is recorded against 1.0.4 or against the current working tree: the newest runs
-in the table above were made by 1.0.3, and everything added since then is in
-[CHANGELOG.md](CHANGELOG.md) under `Unreleased`. What covers that gap is the test suite in
+No end-to-end run is recorded against 1.0.4, 1.0.5 or against the current working tree: the newest
+runs in the table above were made by 1.0.3, and everything added since then is in
+[CHANGELOG.md](CHANGELOG.md) under
+[1.0.5](CHANGELOG.md#105---2026-10-23). What covers that gap is the test suite in
 [Tests](#tests), which exercises the INF text handling and the gate end to end against a synthetic
 package - it is not a substitute for a real run on real hardware, and a driver release that is not
 listed above is still unverified in the sense that matters.
@@ -681,15 +733,28 @@ So the only real lever is to have fewer INFs, which is what `-PruneForeignOemInf
 A stock package ships 43 display INFs: the generic desktop one plus one per laptop OEM. Usually
 exactly one can apply to any given machine. An INF survives if it can match a GPU actually present,
 if this toolkit patches it **and** one of its whitelist entries names present hardware, or if you
-passed `-KeepInf`. Everything else goes, along with its manifest entry.
+passed `-KeepInf`. Everything else goes, along with its manifest entry. The catalog and filter files
+that share a pruned INF's stem are not touched and keep their manifest entries too: nothing here can
+establish whether an INF that was kept references them, so the step leaves them and says that it did
+rather than delete files it cannot account for.
 
 That second condition matters more than it sounds. Keeping every INF the toolkit *could* patch is
 too generous: on this machine it retained `nvamig.inf`, whose three whitelist entries are all RTX
 A3000m, on a box with an A2000m. That INF is 3.9 MB with 62,280 lines and 3,010 sections against
 `nv_dispig.inf`'s 677 KB, and on its own it accounted for three quarters of the catalog build.
 A whitelist INF pruned this way is reported by the later steps as a note ("was pruned from this
-package - its N entries do not apply"), not as a missing-INF warning, so that warning still
-means what it says: the release renamed or dropped an INF the toolkit needs.
+package - its N entries do not apply") rather than as a missing-INF failure. The gate treats an
+unresolved whitelist INF as an error, precisely because the entries filed under it are the ones
+nobody checked, so a deliberate prune has to be named for a pruned run to pass - which the pipeline
+does on its own. That is what keeps the error meaning what it says: the release renamed or dropped
+an INF the toolkit needs, and a build that ships without one it was supposed to patch no longer
+reaches the signing step.
+
+The keep rule is answered for the GPU that is actually here, subsystem included. An OEM INF whose
+device id matches this card but whose subsystem does not is reported as uncovered, naming the device
+and subsystem that are really present, rather than being vouched for by a `whitelist.json` entry that
+describes a different card. An entry that does cover this exact GPU but lives in no INF this package
+ships is a note that it will be supported once the package is patched.
 
 Measured on 616.86, 43 INFs down to 1:
 
@@ -962,11 +1027,13 @@ no password exists anywhere in the run.
 too:
 
 ```powershell
-Import-PfxCertificate -FilePath "Certificates\DriverPatchSigning.pfx" -CertStoreLocation Cert:\CurrentUser\My
+Import-PfxCertificate -FilePath "Certificates\DriverPatchSigning_<thumbprint>.pfx" -CertStoreLocation Cert:\CurrentUser\My
 ```
 
-Until you do, pass `-PfxPath` and supply its password; the script warns that the password will be
-briefly visible on signtool's command line.
+The exports are named after the certificate, so more than one `.pfx` can end up in that folder; the
+newest one is what the GUI offers when a run stops for lack of a key. Until you import, pass
+`-PfxPath` and supply its password; the script warns that the password will be briefly visible on
+signtool's command line.
 
 **Timestamping is best-effort.** A timestamp is attempted first, and if the timestamp server is
 unreachable the catalog is still signed, with a warning, instead of failing the whole run. Pass
@@ -1102,7 +1169,18 @@ to create a new certificate, and that has knock-on costs:
 - Packages you signed earlier still carry the **old** certificate. They keep working only while
   that old certificate stays trusted. Re-sign them, or keep both trusted, or accept that the older
   packages become uninstallable.
-- A new certificate has **no `.pfx` backup** unless you ask for one with `-Exportable`.
+- A new certificate has **no `.pfx` backup** unless you ask for one with `-Exportable`, and the
+  `.pfx` it does write is named after the new thumbprint.
+
+Minting is guarded, because every part of this failure mode was silent. A **valid** certificate with
+the subject you are about to create is refused - two certificates under one subject are
+indistinguishable in every UI that shows them, and it is entirely possible to trust one and sign with
+the other - and the message names the thumbprint to sign with instead, or `-Force` if a second one is
+really wanted. An expired namesake does not block: making the next certificate is the right answer
+when the old one aged out, so those are reported rather than treated as a conflict. A `-Subject`
+outside the patterns this toolkit recognises a project certificate by gets a warning, because that
+certificate is invisible to the next run's certificate resolution and to the cleanup alike. And
+neither the `.cer` nor the `.pfx` of a thumbprint that already has one is rewritten.
 
 So renaming is worth doing when you are about to mint a certificate anyway, and rarely worth doing
 on its own. Nothing forces you to switch: the existing certificate signs future driver releases
@@ -1189,7 +1267,8 @@ don't match your hardware, no effect either way.
   machines.
 - The signing key is created **non-exportable** and never leaves `Cert:\CurrentUser\My`, so by
   default there is no private-key file to leak. If you opt into one with `-Exportable`, keep
-  `Certificates\DriverPatchSigning.pfx` private — anyone with it could sign other kernel drivers
+  `Certificates\DriverPatchSigning_<thumbprint>.pfx` private — anyone with it could sign other
+  kernel drivers
   that your machine (once you've trusted the cert) would accept.
 - Trusting the certificate is the part with real blast radius, not the patching. Prune what you no
   longer need — see [Cleaning up trusted certificates](#cleaning-up-trusted-certificates) — and
@@ -1199,4 +1278,4 @@ don't match your hardware, no effect either way.
 
 - **qron88** — author.
 - **Qwen (self-hosted LLM)** — analysis and engineering support on [1.0.4](CHANGELOG.md#104---2026-10-12):
-  dependency-bar analysis, the 7z-free unpack route, tool preflight, and the verified-release matrix.
+  dependency-bar analysis, tool preflight, and the verified-release matrix.
