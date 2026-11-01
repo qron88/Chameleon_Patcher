@@ -13,19 +13,6 @@ and nowhere else; see [Version](README.md#version).
 
 ### Added
 
-- **Tests for the INF text handling.** `Tests\PatchToolDiscovery.Tests.ps1` covers the shared
-  helpers - the section-index walk, device-line matching, `whitelist.json`-to-INF filename
-  resolution, and reading a certificate thumbprint from a `.cer`.
-  `Tests\InfPatchIntegrity.Tests.ps1` builds a synthetic `Display.Driver`
-  package, runs the real patchers against it and the verification gate before and after, and
-  asserts that the insertions land with the section bodies rather than in the blank gap after them,
-  that the patched package passes the gate, that a second pass leaves the file byte-identical, and
-  that the INF is still BOM-less UTF-8 with CRLF endings after three writers have opened it. Those 58
-  cases run in Pester 3.4 syntax, so they run on PowerShell 5.1 and 7 alike. They paid for themselves
-  the day they were written: the section-index helper had been declared with a `[string[]]`
-  parameter, and PowerShell refuses to bind an array containing an empty string to one - which
-  describes every real INF file, so all three writers would have thrown on the first blank line of
-  any real package. The tests caught it before it shipped.
 - **The installer checkbox refuses the wrong certificate.** `Add-SetupCertOption.ps1` takes
   `-ExpectThumbprint`, defaulting to the certificate that actually signs the package's `.cat`
   files, and throws if the `.cer` it is about to bind differs. Left ticked, that checkbox trusts
@@ -41,7 +28,7 @@ and nowhere else; see [Version](README.md#version).
   `Get-InfDeviceLine` / `Test-InfDeviceIdMatch` extended to `[Strings]` and misc-section lookups,
   `Get-CerThumbprint -Path`, and `Get-DriverVersionTextFromPath` / `Get-PathVersionForSort`.
 - **A reader and a writer that agree about the bytes of a package file.** `Get-InfTextFile` sniffs a
-  file's BOM, decides UTF-8 or this machine's ANSI codepage by trial - strict UTF-8 first, with a
+  file's BOM, decides UTF-8 or the machine's ANSI codepage by trial - strict UTF-8 first, with a
   warning naming the codepage it settled on - and records which line terminator the file uses and
   whether its last line is terminated at all. `Write-InfLines -State` and `Write-InfText -State`
   write it back with those same settings, and `Get-AnsiEncoding` is what the fallback reads its
@@ -49,18 +36,6 @@ and nowhere else; see [Version](README.md#version).
   patcher, the RM override, the optional-components step, the prune step, `Add-SetupCertOption.ps1`
   - and so do the verification gate's own two reads, so the gate certifies the bytes the patchers
   actually wrote instead of the bytes it assumed.
-- **Two more suites, one per behaviour this release changes.**
-  `Tests\ExtraGpuSectionPlacement.Tests.ps1` (11 cases) patches a fixture whose *last*
-  `[NVIDIA_Devices*]` block ends in a blank tail at end of file, which is the case an insertion rule
-  gets wrong when it treats a section's exclusive upper bound as its insertion point, and checks
-  that every insertion lands inside a device section. The same fixture then checks what the patchers
-  leave behind byte-wise - a BOM stays a BOM, LF-only lines stay LF-only, a byte outside UTF-8
-  survives the patch and reads back the same - and the RM override patcher gets those three byte
-  checks too. `Tests\ForeignOemPrune.Tests.ps1` (8 cases) covers the prune step: which INFs survive,
-  the keep-everything fallback, what the safety net says about hardware that is present but not
-  installable through the INF it kept, and what happens to the manifest's own bytes. Four of those
-  eight fail against the previous revision of `Remove-ForeignOemInfs.ps1`, so they pin the fixes
-  below rather than describe the code as it now stands. 61 cases in all.
 - **A device line whose name was never defined says so.** An INF with no `[Strings]` section still
   takes the device entry and still installs, but the `%token%` in its device name is never defined,
   so Device Manager shows the token itself. The patcher now warns once per INF instead of leaving
@@ -151,6 +126,11 @@ and nowhere else; see [Version](README.md#version).
 
 ### Fixed
 
+- **The shared section-index helper refused to run on a real INF.** It was declared with a
+  `Mandatory [string[]]` parameter, and PowerShell will not bind an array whose elements include an
+  empty string to one - and an INF body is full of blank lines (confirmed on PowerShell 5.1 and 7.6).
+  All three writers would have thrown on the first blank line of any real package. The parameter is
+  deliberately untyped now, and the patchers pass a `List[string]`.
 - **A continued line was missed when the backslash was followed by spaces.** The continuation check
   tested whether the raw line ends with a backslash; INF tolerates spaces after it and `Get-Content
   ` keeps them, so the exact split the check exists to find went unreported. It now treats the
@@ -172,10 +152,9 @@ and nowhere else; see [Version](README.md#version).
   drift", but the number lives in the compiled GUI while everything it runs is read from `Scripts\`
   at start time, so a binary left in a tree whose scripts moved on stamps an older number over newer
   behaviour. The version section now says what a run is actually identified by - the version plus
-  the revision of `Scripts\` beside the `.exe` - and the verified-releases table says plainly that no
-  end-to-end run is recorded against 1.0.4 or later, that the `Logs\` its numbers come from are
-  git-ignored and so absent from a clone, and that the test suite covers the INF handling but is not
-  a substitute for a run on real hardware.
+  the revision of `Scripts\` beside the `.exe` - and the README says plainly that no end-to-end run
+  is recorded against 1.0.4 or later, and that a run on real hardware is the only thing that closes
+  that gap.
 - **Two couplings that were nobody's to read about are now written down.** The GUI identifies a
   missing `.pfx` password by matching the literal phrase `none was supplied and prompting is
   disabled` in the child's output and only then offers the `Import-PfxCertificate` line that fixes it
@@ -193,8 +172,9 @@ and nowhere else; see [Version](README.md#version).
   decoded it as UTF-8 and the unreadable bytes arrived as U+FFFD, which the writer wrote out
   faithfully. Either way a signed package ended up containing text the stock package never had. The
   writers read through `Get-InfTextFile` now, which names the encoding it settled on and writes the
-  file back in that encoding. This is verified against a fixture written in this machine's ANSI
-  codepage, not against a real NVIDIA INF: no package on this machine is known to be non-UTF-8.
+  file back in that encoding. This is verified against a synthetic file written in a legacy ANSI
+  codepage, not against a real NVIDIA INF: no real package known to be non-UTF-8 has been available
+  to test against.
 - **Line endings were normalised on the way through a patch.** The shared writer joined every line
   with CRLF, so a package file whose lines end in LF alone came back with every one of its lines
   rewritten - a patch that was supposed to add two device lines produced a diff of the whole file,
@@ -233,24 +213,15 @@ and nowhere else; see [Version](README.md#version).
   functions in `PatchToolDiscovery.ps1` and `Unpack-DriverExe.ps1`, the `-SetupExePath` parameter of
   `Unpack-DriverExe.ps1`, the extra scan roots and the poll that counted files and bytes written
   while a package expanded into a folder the toolkit did not choose, the unreadable-root check, the
-  version guard against a cached expansion, and the 31 cases covering all of it are removed. A
+  version guard against a cached expansion, are all removed. A
   driver download is unpacked by a 7z-compatible CLI or not at all, and a missing CLI fails the
   preflight naming what has to be installed and where to get it. The names
   that were deleted are readable in the history of those two files.
 - **The driver-version path helpers.** `Get-DriverVersionTextFromPath`, `Get-PathVersionForSort`
   and `Get-NormalizedDriverVersion` read a driver version out of a path, or compared two version
   texts as versions. Nothing in this toolkit reads a driver version out of a path any more, so no
-  script here needed them, and helpers used only by their own tests are how a toolkit accumulates
-  code nobody is willing to delete.
-
-**A note about the tests.** The four suites under Added were written and run green during this
-release, but the `Tests\` folder was lost on the machine the work was done on before this entry was
-committed. What git carries for `Tests\` is the pair of files from before 1.0.5, and those exercise
-helpers this release deleted; the two suites written for the changed insertion rule and for the prune
-step were never committed at all. So the case counts above describe the suites as they were written
-and verified, not as they are committed, and `Invoke-Pester Tests` on this tree runs cases that no
-longer match these scripts. The README's [Tests](README.md#tests) chapter says the same thing, and it
-is the specification to rebuild from.
+  script here needed them, and a helper nothing calls is how a toolkit accumulates code nobody is
+  willing to delete.
 
 ## [1.0.4] - 2026-10-12
 
@@ -278,12 +249,11 @@ is the specification to rebuild from.
   A crash now writes a `[crash]` line into the run log when one is open and shows one readable
   dialog. The log is this tool's primary diagnostic artifact, so a crash that leaves it silent was
   the worst available failure mode.
-- **A verified driver-release matrix in the README** - see
-  [Verified driver releases](README.md#verified-driver-releases): 595.79, 616.86, 616.92, 617.14
-  and 617.42, each with the toolkit version, the build type, the verification gate's own verdict
-  and the outcome, with the 617.x rows read out of the run logs. It states what "verified" covers
-  (pipeline completed, gate passed, catalog signed) and what it does not (installed and driven on
-  real hardware), and says plainly that Blackwell is out of scope.
+- **A documented release-verification record.** The README states, for each driver release the
+  toolkit has been run against end to end, the toolkit version, the build type, the verification
+  gate's own verdict and the outcome. It states what "verified" covers (pipeline completed, gate
+  passed, catalog signed) and what it does not (installed and driven on real hardware), and says
+  plainly that Blackwell is out of scope.
 
 ### Changed
 
@@ -369,8 +339,9 @@ is the specification to rebuild from.
   folder and deleted only after verification passes; a failure moves them back and restores the
   manifest. `Enable-OptionalComponents.ps1` likewise restores `setup.cfg` if its edit does not
   verify.
-- **A pruned build warned about whitelist INFs it had just pruned on purpose.** On an A2000m
-  box, `-PruneForeignOemInfs` removes `nvami.inf` because its three entries are all RTX A3000m,
+- **A pruned build warned about whitelist INFs it had just pruned on purpose.** On a machine
+  carrying one mobile part, `-PruneForeignOemInfs` removes `nvami.inf` because its three entries all
+  name a different mobile part,
   and then the whitelist step, the optional-components step and the verification gate each
   warned that the INF was missing and that "NVIDIA may have renamed or dropped" it. Three
   warnings on every pruned run teach you to ignore the one that matters. The pipeline now records
