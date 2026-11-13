@@ -98,6 +98,27 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 - The README said the `.pfx` password variable stayed in the child's environment for the whole run;
   the pipeline has removed it before doing anything else since 1.0.5.
 
+- **A driver download must be NVIDIA's own.** The signature check accepted Microsoft-signed files
+  too (WHQL countersigns NVIDIA's catalogs), so any Microsoft-signed `.exe` - `cmd.exe`, say - passed
+  as a driver source. `.exe` sources now require NVIDIA (`Test-NvidiaSignature -NvidiaOnly`); catalogs
+  and installer plugins still accept either. Found while writing the tests below.
+
+### Added
+
+- **The Pester suites are back** (`Tests\`, deleted in `71ea1de`): 76 tests, ~5 s, Pester 3.4 as
+  shipped with Windows PowerShell 5.1, run with `.\Tests\Run.ps1` (exit code = failures). The
+  recovered `InfPatchIntegrity` suite passed unchanged; `PatchToolDiscovery` had stopped loading
+  because it imported functions of the unpack route 1.0.5 removed - those four blocks are gone, and
+  new ones cover the rename ambiguity, atomic and byte-faithful writes (BOM + LF, ANSI), the RM
+  directive test, the template/donor merge, certificate identity (certificates built in memory, no
+  store touched), catalog membership (`New-FileCatalog`), source verification and System32 paths.
+  The integration suite gained a fixture shaped like a real release, so the donor merge, the
+  stale-section gate, the shared-section clone, the RM-in-a-comment case and name collisions run
+  end to end. Restoring them also caught a defect in the old fixture (a stock section referencing a
+  missing `[Section001.CopyFiles]`), which the gate's new stock-section audit now reports.
+- **`AGENTS.md`**: why each mechanism exists, for reviewers - human or model - before they propose
+  removing one.
+
 ### Removed
 
 - `signtool /f /p` signing, and the informational `signtool verify /pa` call.

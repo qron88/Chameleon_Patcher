@@ -1390,17 +1390,27 @@ function Get-InfDeclaredCatalog {
 }
 
 function Test-NvidiaSignature {
-    <# $null when the file carries a valid Authenticode signature from NVIDIA or Microsoft, else why not. #>
-    param([Parameter(Mandatory = $true)][string]$Path)
+    <#
+       $null when the file carries a valid Authenticode signature from NVIDIA - or, unless -NvidiaOnly,
+       from Microsoft - else the reason it does not. Microsoft is accepted for what WHQL signs: a
+       driver catalog is countersigned by "Microsoft Windows Hardware Compatibility Publisher". A driver
+       DOWNLOAD must be NVIDIA's own: without -NvidiaOnly, any Microsoft-signed .exe (cmd.exe, say)
+       would pass as a driver source.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$NvidiaOnly
+    )
     $sig = Get-AuthenticodeSignature -LiteralPath $Path
     if ($sig.Status -ne 'Valid') {
         $who = if ($sig.SignerCertificate) { " (signer: $($sig.SignerCertificate.Subject))" } else { "" }
         return "signature status is $($sig.Status)$who"
     }
     $subject = $sig.SignerCertificate.Subject
-    if ($subject -notmatch '(^|,\s*)O=NVIDIA Corporation(,|$)' -and $subject -notmatch '(^|,\s*)O=Microsoft Corporation(,|$)') {
-        return "it is validly signed, but by $subject, not by NVIDIA or Microsoft"
-    }
+    $isNvidia = $subject -match '(^|,\s*)O=NVIDIA Corporation(,|$)'
+    $isMicrosoft = $subject -match '(^|,\s*)O=Microsoft Corporation(,|$)'
+    if ($NvidiaOnly -and -not $isNvidia) { return "it is validly signed, but by $subject, not by NVIDIA" }
+    if (-not $isNvidia -and -not $isMicrosoft) { return "it is validly signed, but by $subject, not by NVIDIA or Microsoft" }
     return $null
 }
 
@@ -1428,7 +1438,7 @@ function Test-DriverSource {
     $notes = New-Object System.Collections.Generic.List[string]
 
     if ($ExePath) {
-        $why = Test-NvidiaSignature -Path $ExePath
+        $why = Test-NvidiaSignature -Path $ExePath -NvidiaOnly
         if ($why) { $problems.Add("$(Split-Path $ExePath -Leaf): $why") }
         else { $notes.Add("$(Split-Path $ExePath -Leaf): valid NVIDIA signature") }
     }
@@ -1439,7 +1449,7 @@ function Test-DriverSource {
         $signedCats = @()
         foreach ($name in $catalogs.Keys) {
             $cp = Join-Path $dd $name
-            if (-not (Test-Path -LiteralPath $cp)) { $problems.Add("$name is declared by $($catalogs[$name].Count) INF(s) but is not in the folder."); continue }
+            if (-not (Test-Path -LiteralPath $cp -PathType Leaf)) { $problems.Add("$name is declared by $($catalogs[$name].Count) INF(s) but is not a file in the folder."); continue }
             $why = Test-NvidiaSignature -Path $cp
             if ($why) { $problems.Add("${name}: $why"); continue }
             $signedCats += (Resolve-Path -LiteralPath $cp).Path

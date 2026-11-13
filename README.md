@@ -110,6 +110,7 @@ Source\                 Chameleon-Patcher.cs + Build.ps1 (csc.exe from .NET Fram
 Scripts\                the pipeline; every script also runs standalone
   PatchToolDiscovery.ps1   shared helpers: tool discovery, INF parsing/writing, catalogs, certificates
   whitelist.json           the 61 entries with their captured section templates
+Tests\                  Pester 3.4 suites (Run.ps1, ~5 s, nothing installed or touched outside %TEMP%)
 Assets\                 icon sources (Build-Icon.ps1)
 Logs\, Certificates\, Drivers\, *_Patched*\   runtime state, git-ignored
 ```
@@ -118,8 +119,9 @@ Logs\, Certificates\, Drivers\, *_Patched*\   runtime state, git-ignored
 
 1.0.6. The version lives in the assembly attributes at the top of `Source\Chameleon-Patcher.cs` and
 shows in the title bar, the file properties and every log header. A release is: bump those
-attributes, add a dated `CHANGELOG.md` heading, rebuild with `.\Source\Build.ps1`, and commit the
-`.exe` together with the scripts it runs.
+attributes, add a dated `CHANGELOG.md` heading, run `.\Tests\Run.ps1`, rebuild with
+`.\Source\Build.ps1`, and commit the `.exe` together with the scripts it runs. Before reworking a
+mechanism, read [AGENTS.md](AGENTS.md) - it says why each one is the way it is.
 
 ## Contributors
 
