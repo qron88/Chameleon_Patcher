@@ -76,13 +76,31 @@ if (-not $isAdmin) {
 
 $cert = Get-PfxCertificate -FilePath $CerPath
 
+# Only a certificate shaped like the ones this toolkit mints goes into Root from here: self-signed,
+# Code Signing, not a CA. On a target PC the default is "the newest .cer in Certificates", and a
+# file dropped there must not become a machine-wide root because it was newest.
+$notOurs = Test-ProjectSigningCertificate -Certificate $cert
+if ($notOurs) {
+    throw "Refusing to trust $(Split-Path $CerPath -Leaf): $notOurs. This script only trusts the self-signed code-signing certificate the patch toolkit mints."
+}
+
+# Root trust only matters for a kernel driver under Test Signing (or with enforcement disabled for
+# the boot). Say so up front if it is off, rather than after the driver fails to load.
+try {
+    $bcd = & (Get-SystemToolPath 'bcdedit.exe') /enum '{current}' 2>$null
+    if (-not ($bcd | Select-String -Pattern '^\s*testsigning\s+Yes' -Quiet)) {
+        Write-Warning "Test Signing mode is OFF on this boot. Trusting the certificate alone will not let the patched driver load - also run 'bcdedit /set testsigning on' (Secure Boot off) and reboot, or disable driver signature enforcement for one boot."
+    }
+}
+catch { }
+
 $stores = @('Root')
 if (-not $SkipTrustedPublisher) { $stores += 'TrustedPublisher' }
 
 Write-Host "About to trust this certificate machine-wide:" -ForegroundColor Yellow
 Write-Host "  Subject:    $($cert.Subject)"
 Write-Host "  Issuer:     $($cert.Issuer)"
-Write-Host "  Thumbprint: $($cert.Thumbprint)"
+Write-Host "  Thumbprint: $($cert.Thumbprint)   <- compare with the thumbprint the signing run printed"
 Write-Host "  Expires:    $($cert.NotAfter)"
 Write-Host "  Stores:     $($stores -join ', ') (LocalMachine)"
 Write-Host ""
@@ -92,7 +110,7 @@ Write-Host ""
 
 if ($PSCmdlet.ShouldProcess("$($stores -join ' and ') certificate store(s) on this machine", "Add certificate $($cert.Thumbprint)")) {
     foreach ($store in $stores) {
-        certutil -addstore $store $CerPath
+        & (Get-SystemToolPath 'certutil.exe') -addstore $store $CerPath
         if ($LASTEXITCODE -ne 0) { throw "certutil -addstore $store failed with exit code $LASTEXITCODE." }
     }
     Write-Host "`nDone. The driver catalog signed with this certificate will now pass signature" -ForegroundColor Green

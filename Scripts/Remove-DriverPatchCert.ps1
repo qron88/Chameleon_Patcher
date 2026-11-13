@@ -80,6 +80,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Test-ProjectSigningCertificate: the same "is this one of ours" rule the pipeline's automatic
+# cleanup uses, so -AllPatchCerts never sweeps up a third-party CA that merely shares a name.
+. (Join-Path $PSScriptRoot 'PatchToolDiscovery.ps1')
+
 $trustStores = @('Root', 'CA', 'TrustedPublisher')
 $locations = switch ($Scope) {
     'CurrentUser'  { @('CurrentUser') }
@@ -164,7 +168,15 @@ if (-not $Thumbprint -and -not $AllPatchCerts) {
 $normalizedKeep = @($KeepThumbprint | ForEach-Object { ($_ -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() })
 
 if ($AllPatchCerts) {
-    $targets = @($patch | Where-Object { $normalizedKeep -notcontains $_.Thumbprint })
+    # A subject pattern is a name match, not an identity. -AllPatchCerts only takes certificates that
+    # are also self-signed code-signing non-CA certificates; anything else matching the pattern is
+    # listed and left for an explicit -Thumbprint.
+    $targets = @()
+    foreach ($e in @($patch | Where-Object { $normalizedKeep -notcontains $_.Thumbprint })) {
+        $why = Test-ProjectSigningCertificate -Certificate $e.Cert
+        if ($why) { Write-Warning "Not selected by -AllPatchCerts: $($e.Location)\$($e.StoreName) $($e.Thumbprint) ($($e.Subject)) - $why. Name it with -Thumbprint if you really mean it."; continue }
+        $targets += $e
+    }
 }
 else {
     $normalizedWanted = @($Thumbprint | ForEach-Object { ($_ -replace '[^0-9A-Fa-f]', '').ToUpperInvariant() })

@@ -216,7 +216,7 @@ foreach ($t in $targets) {
     # A device entry, [Strings] definition or RM override split across physical lines with a
     # trailing backslash is invisible to every per-line matcher below, which would then certify an
     # INF it only partly read. Report it rather than pass over it.
-    Test-InfLineContinuations -Path $infPath -Lines $lines
+    [void](Test-InfLineContinuations -Path $infPath -Lines $lines)
 
     $sections = Get-InfSections -Lines $lines
 
@@ -239,6 +239,7 @@ foreach ($t in $targets) {
     $missing = New-Object System.Collections.Generic.List[string]
     $badSection = New-Object System.Collections.Generic.List[string]
     $badToken = New-Object System.Collections.Generic.List[string]
+    $whitelistSections = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 
     foreach ($entry in $entries) {
         $totalChecked++
@@ -263,6 +264,7 @@ foreach ($t in $targets) {
         if ($absentFrom.Count -eq 0) { $totalPresent++ }
 
         foreach ($p in @($hits | Sort-Object Section, Token -Unique)) {
+            [void]$whitelistSections.Add($p.Section)
             if (-not $sections.ContainsKey($p.Section)) {
                 $badSection.Add("$idLabel -> [$($p.Section)] (section header absent)")
             }
@@ -272,11 +274,19 @@ foreach ($t in $targets) {
         }
     }
 
-    # Validate that spliced-in sections' own references resolve in this INF.
+    # Validate that the references resolve in this INF: every spliced-in section, and every stock
+    # section a whitelisted device line was pointed at (an entry that reuses a stock section depends
+    # on that section's AddReg/CopyFiles targets just as much as a spliced one does).
+    $toAudit = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $sections.Keys) { if ($k -match '^SectionExtraGPU') { [void]$toAudit.Add($k) } }
+    foreach ($s in $whitelistSections) {
+        foreach ($k in $sections.Keys) {
+            if ($k -eq $s -or $k.StartsWith($s + '.', [StringComparison]::OrdinalIgnoreCase)) { [void]$toAudit.Add($k) }
+        }
+    }
     $unresolved = New-Object System.Collections.Generic.List[string]
     $unresolvedIncludes = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($k in $sections.Keys) {
-        if ($k -notmatch '^SectionExtraGPU') { continue }
+    foreach ($k in $toAudit) {
         $refs = Get-ReferencedSections -Body $sections[$k]
         foreach ($r in $refs.Sections) {
             if (-not $sections.ContainsKey($r)) { $unresolved.Add("[$k] references missing section [$r]") }
@@ -290,6 +300,22 @@ foreach ($t in $targets) {
     if ($unresolvedIncludes.Count -gt 0) {
         $warnings.Add("${infName}: CopyINF/Include target(s) not found in this package tree: $(($unresolvedIncludes | Sort-Object) -join ', '). Stock INFs reference these the same way and Windows resolves them from other subpackages or its own INF store, so this is informational - just confirm those subpackages are present if the install misbehaves.")
     }
+
+    # A spliced family must do every job its closest stock install section does - the same merge the
+    # patcher applies (Merge-InfTemplateWithDonor), asked the other way round: anything it WOULD add
+    # now is something this package's spliced section is missing, e.g. a CopyFiles list NVIDIA
+    # introduced after the template was captured.
+    $stale = New-Object System.Collections.Generic.List[string]
+    $bodies = Get-InfSectionBody -Lines $lines
+    $stockInstall = @($lines | ForEach-Object { Get-InfDeviceLine -Line $_ } | Where-Object { $_ } |
+        ForEach-Object { $_.Section } | Where-Object { $_ -notmatch '^SectionExtraGPU' } | Select-Object -Unique)
+    foreach ($k in @($bodies.Keys | Where-Object { $_ -match '^SectionExtraGPU[^.]*$' })) {
+        $fam = [ordered]@{ '_base' = @($bodies[$k]) }
+        foreach ($n in $bodies.Keys) { if ($n.StartsWith($k + '.', [StringComparison]::OrdinalIgnoreCase)) { $fam[$n.Substring($k.Length + 1)] = @($bodies[$n]) } }
+        $m = Merge-InfTemplateWithDonor -TemplateFamily $fam -Sections $bodies -InstallSections $stockInstall
+        if ($m.Donor -and $m.Added.Count) { $stale.Add("[$k] lacks what its closest stock section [$($m.Donor)] carries: $($m.Added -join '; ')") }
+    }
+    foreach ($m in $stale) { $errors.Add("${infName}: $m") }
 
     $spliced = @($sections.Keys | Where-Object { $_ -match '^SectionExtraGPU' }).Count
     Write-Host ("  {0,-16} {1}/{2} whitelisted, {3} device block(s), {4} spliced section(s){5}" -f `
@@ -319,7 +345,7 @@ if (-not $SkipRmOverrideCheck) {
             $found++
             $rmSectionsTotal++
             $hasKey = $false
-            foreach ($l in $sections[$k]) { if ($l -match 'RM1457588') { $hasKey = $true; break } }
+            foreach ($l in $sections[$k]) { if (Test-InfRmOverrideLine $l) { $hasKey = $true; break } }
             if (-not $hasKey) { $rmSectionsMissing.Add("$($_.Name) [$k]") }
         }
         if ($found -gt 0) { $infsWithRmSections++ }
