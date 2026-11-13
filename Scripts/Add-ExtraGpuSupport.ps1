@@ -18,8 +18,9 @@
     2. If another block already lists the entry, or the same DEV id appears under a different
        subsystem, reuses that line's Section (guaranteed valid/current for that chip in this
        driver version).
-    3. Otherwise creates a new, uniquely-named Section by copying the section body captured from the
-       reference "Franken" package, and points the new match line at it.
+    3. Otherwise creates a new, uniquely-named Section from the section body captured from the
+       reference "Franken" package, brought up to date with the closest stock install section of
+       this release (Merge-InfTemplateWithDonor), and points the new match line at it.
   Then adds the matching [Strings] description if missing. What counts as a match is decided by
   Test-InfDeviceIdMatch in PatchToolDiscovery.ps1, the same rule the verification gate applies.
 
@@ -145,8 +146,16 @@ function Patch-InfFile {
 
     $addedCount = 0
     $skippedCount = 0
-    $newSectionSuffix = 0
     $stringsWarned = $false
+
+    # The stock layout, read once before anything is spliced in: section bodies, and the install
+    # sections NVIDIA's own device lines point at. Templates are merged against these, so a donor is
+    # always a section NVIDIA shipped in THIS release, never one this run created.
+    $stockSections = Get-InfSectionBody -Lines $lines
+    $installSections = @($lines | ForEach-Object { Get-InfDeviceLine -Line $_ } | Where-Object { $_ } |
+        ForEach-Object { $_.Section } | Where-Object { $_ -notmatch '^SectionExtraGPU' } | Select-Object -Unique)
+    $usedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($n in $stockSections.Keys) { [void]$usedNames.Add($n) }
 
     foreach ($entry in $Entries) {
         $dev = $entry.dev
@@ -193,20 +202,33 @@ function Patch-InfFile {
         # AddService directives contained SPSVCINST_ASSOCSERVICE" if only the base section is
         # copied, so every companion has to be emitted too.
         $familyLines = @()
+        $mergeNote = ""
         if (-not $targetSection) {
-            $newSectionSuffix++
-            $targetSection = "SectionExtraGPU$($dev)_$newSectionSuffix"
             $family = $entry.template_section_family
             if (-not $family -or -not ($family.PSObject.Properties | Where-Object Name -eq '_base')) {
                 Write-Warning "No template body captured for DEV_$dev/$subsys - skipping (would create empty section)."
                 continue
             }
-            foreach ($prop in $family.PSObject.Properties) {
-                $suffix = $prop.Name
-                $body = $prop.Value
-                if (-not $body -or @($body).Count -eq 0) { continue }
+            # A name nothing in the file uses yet - neither a stock section nor one an earlier run or
+            # an earlier entry spliced in. A reused name would merge two install sections into one.
+            $n = 1
+            while ($usedNames.Contains("SectionExtraGPU$($dev)_$n")) { $n++ }
+            $targetSection = "SectionExtraGPU$($dev)_$n"
+            [void]$usedNames.Add($targetSection)
+
+            # Bring the captured body up to date with this release (see Merge-InfTemplateWithDonor).
+            $merged = Merge-InfTemplateWithDonor -TemplateFamily $family -Sections $stockSections -InstallSections $installSections
+            if ($merged.Donor) {
+                if ($merged.Added.Count) { $mergeNote = " [+$($merged.Added.Count) line(s) from stock [$($merged.Donor)]: $($merged.Added -join '; ')]" }
+            }
+            else {
+                Write-Warning "DEV_$dev/${subsys}: no stock install section in $(Split-Path $Path -Leaf) is close enough to the captured template (best match $([math]::Round($merged.Similarity, 2))) - using the template as captured. Check that it still copies everything this release needs."
+            }
+            foreach ($suffix in $merged.Family.Keys) {
+                $body = @($merged.Family[$suffix])
+                if ($body.Count -eq 0) { continue }
                 $sectionName = if ($suffix -eq '_base') { $targetSection } else { "$targetSection.$suffix" }
-                $familyLines += [string[]](@("[$sectionName]") + @($body) + @(""))
+                $familyLines += [string[]](@("[$sectionName]") + $body + @(""))
             }
         }
 
@@ -247,6 +269,7 @@ function Patch-InfFile {
             if (-not $hasString) {
                 $desc = $entry.description
                 if (-not $desc) { $desc = "NVIDIA Graphics Device" }
+                $desc = $desc -replace '"', '""'   # INF string literals escape a quote by doubling it
                 $lines.Insert($(Get-InfSectionIndex -Lines $lines -HeaderIndex $stringsBounds.HeaderIndex -EndIndex $stringsBounds.EndIndex), "$keyName = `"$desc`"")
             }
         }
@@ -261,7 +284,7 @@ function Patch-InfFile {
 
         $addedCount++
         $partial = if ($lacking.Count -lt $blocks.Count) { " [added to $($lacking.Count) of $($blocks.Count) device blocks; the rest already had it]" } else { "" }
-        Write-Host "  + DEV_$dev$(if($subsys){"&SUBSYS_$subsys"}) -> $targetSection ($($entry.description))$partial"
+        Write-Host "  + DEV_$dev$(if($subsys){"&SUBSYS_$subsys"}) -> $targetSection ($($entry.description))$partial$mergeNote"
     }
 
     Write-Host "  Added: $addedCount, already present: $skippedCount" -ForegroundColor Green

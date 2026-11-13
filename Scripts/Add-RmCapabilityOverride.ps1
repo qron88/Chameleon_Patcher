@@ -86,14 +86,24 @@ Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
     $infsWithMiscSections++
 
     $patchedHere = 0
-    # Process bottom-up so each Insert() doesn't invalidate the indices still queued above it.
+    # Each header's end is the next header in the file. Looked up through a header -> next-header map
+    # built in one pass; a pipeline filter over every header per section was quadratic on the 3,000-
+    # section OEM INFs.
+    $nextHeaderOf = @{}
+    for ($k = 0; $k -lt $allHeaderIdx.Count; $k++) {
+        $nextHeaderOf[$allHeaderIdx[$k]] = if ($k + 1 -lt $allHeaderIdx.Count) { $allHeaderIdx[$k + 1] } else { -1 }
+    }
+    # Process bottom-up so each Insert() doesn't invalidate the indices still queued above it. The
+    # end positions were taken before any insert, and an insert only shifts lines BELOW it, which
+    # have already been handled by then.
     foreach ($hIdx in ($miscHeaderIdx | Sort-Object -Descending)) {
-        $nextHeader = $allHeaderIdx | Where-Object { $_ -gt $hIdx } | Sort-Object | Select-Object -First 1
-        $endIdx = if ($nextHeader) { $nextHeader } else { $lines.Count }
+        $endIdx = if ($nextHeaderOf[$hIdx] -ge 0) { $nextHeaderOf[$hIdx] } else { $lines.Count }
 
+        # The directive itself, on the non-comment part of a line - the same test the gate applies
+        # (Test-InfRmOverrideLine). A comment that merely mentions RM1457588 no longer counts.
         $bodyHasKey = $false
         for ($j = $hIdx + 1; $j -lt $endIdx; $j++) {
-            if ($lines[$j] -match 'RM1457588') { $bodyHasKey = $true; break }
+            if (Test-InfRmOverrideLine $lines[$j]) { $bodyHasKey = $true; break }
         }
         if ($bodyHasKey) { continue }
 

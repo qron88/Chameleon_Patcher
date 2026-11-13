@@ -22,14 +22,12 @@
   whitelisted device line to the install Section it points at, and ensures that Section carries
   both flags.
 
-  WHY IT EDITS SECTIONS IN PLACE. Most whitelisted devices get a freshly spliced
-  SectionExtraGPU* section, and the captured template already contains both flags, so nothing
-  needs doing there. A handful of entries instead REUSE an existing stock section, because
-  Add-ExtraGpuSupport.ps1 prefers a section already valid for that chip in this driver version
-  over a template captured from an older one. Measured on 616.64 and 616.86, every such section is
-  referenced only by the very GPU family being unlocked, so adding a flag there does not spill
-  onto unrelated hardware. The script prints how many device lines share each section it touches,
-  so if a future release breaks that assumption you will see it rather than discover it later.
+  SHARED SECTIONS ARE CLONED, NOT EDITED. Most whitelisted devices get a freshly spliced
+  SectionExtraGPU* section, and the captured template already contains both flags. A few entries
+  instead REUSE an existing stock section, because Add-ExtraGpuSupport.ps1 prefers a section already
+  valid for that chip. When such a section is also used by device lines that are not whitelist
+  entries, it is copied as <section>_ChameleonOpt (with its companions) and only the whitelisted
+  lines are pointed at the copy, so the flags never reach hardware NVIDIA did not flag.
 
   It does NOT remove the setup.cfg constraints. Deleting those would force the components on for
   every GPU including ones NVIDIA flagged as unsupported, which is a much broader change than
@@ -107,41 +105,69 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
         $state = Get-InfTextFile -Path $r.Path
         $lines = [System.Collections.Generic.List[string]](@($state.Lines))
 
-        # Index section bounds, and count how many device lines point at each section.
-        $bounds = @{}
-        $usage  = @{}
-        $current = $null
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^\s*\[([^\]]+)\]\s*$') {
-                if ($current) { $bounds[$current].End = $i }
-                $current = $Matches[1].Trim()
-                if (-not $bounds.ContainsKey($current)) {
-                    $bounds[$current] = [PSCustomObject]@{ Start = $i; End = $lines.Count }
-                }
-                continue
-            }
-            $parsed = Get-InfDeviceLine -Line $lines[$i]
-            if ($parsed) {
-                $t = $parsed.Section
-                if (-not $usage.ContainsKey($t)) { $usage[$t] = 0 }
-                $usage[$t]++
-            }
-        }
-        if ($current) { $bounds[$current].End = $lines.Count }
-
-        # Which sections do the whitelisted devices actually point at? Every line for the entry
-        # counts, not just the first: each [NVIDIA_Devices...] block has its own line, and they
-        # may point at different sections. Matching is the patcher's own rule (Mode Entry).
-        $targets = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        # Which lines do the whitelisted devices own? Every line for the entry counts, not just the
+        # first: each [NVIDIA_Devices...] block has its own line, and they may point at different
+        # sections. Matching is the patcher's own rule (Mode Entry).
+        $ownLines = New-Object 'System.Collections.Generic.HashSet[int]'
         foreach ($e in $entries) {
             $from = 0
             while ($true) {
                 $hit = Find-InfDeviceLine -Lines $lines -Start $from -Dev $e.dev -Subsys $e.subsys -Mode Entry
                 if (-not $hit) { break }
-                [void]$targets.Add($hit.Parsed.Section)
+                [void]$ownLines.Add($hit.Index)
                 $from = $hit.Index + 1
             }
         }
+
+        # A stock section that the unlocked GPUs share with devices NVIDIA itself lists gets cloned
+        # before it is flagged, and only the whitelisted lines are pointed at the clone. Editing it
+        # in place switched PhysX / the NVIDIA App on for every GPU sharing it, which is the broad
+        # change this script exists to avoid.
+        $cloned = 0
+        $bodies = Get-InfSectionBody -Lines $lines
+        $sharedBy = @{}
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($ownLines.Contains($i)) { continue }
+            $p = Get-InfDeviceLine -Line $lines[$i]
+            if ($p) { $sharedBy[$p.Section] = 1 + [int]$sharedBy[$p.Section] }
+        }
+        $cloneOf = @{}
+        foreach ($i in @($ownLines)) {
+            $p = Get-InfDeviceLine -Line $lines[$i]
+            $s = $p.Section
+            if (-not $sharedBy.ContainsKey($s) -or -not $bodies.ContainsKey($s)) { continue }
+            if (-not $cloneOf.ContainsKey($s)) {
+                $clone = $s + '_ChameleonOpt'
+                $n = 1
+                while ($bodies.ContainsKey($clone)) { $n++; $clone = $s + '_ChameleonOpt' + $n }
+                $cloneOf[$s] = $clone
+                [void]$lines.Add('')
+                foreach ($name in @($bodies.Keys | Where-Object { $_ -eq $s -or $_.StartsWith($s + '.', [StringComparison]::OrdinalIgnoreCase) })) {
+                    $lines.Add('[' + $clone + $name.Substring($s.Length) + ']')
+                    foreach ($l in $bodies[$name]) { $lines.Add($l) }
+                    $lines.Add('')
+                }
+                Write-Host ("  [$s] is shared with $($sharedBy[$s]) other device line(s) - cloned as [$clone] for the whitelisted GPUs only")
+                $cloned++
+            }
+            $lines[$i] = [regex]::Replace($lines[$i], '(=\s*)' + [regex]::Escape($s) + '(\s*,)', '${1}' + $cloneOf[$s] + '${2}', 1)
+        }
+
+        # Index section bounds (after any clone), through the toolkit's shared header pattern.
+        $bounds = @{}
+        $current = $null
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $h = $script:InfSectionHeaderRx.Match($lines[$i])
+            if ($h.Success) {
+                if ($current) { $bounds[$current].End = $i }
+                $current = $h.Groups[1].Value.Trim()
+                if (-not $bounds.ContainsKey($current)) { $bounds[$current] = [PSCustomObject]@{ Start = $i; End = $lines.Count } }
+            }
+        }
+        if ($current) { $bounds[$current].End = $lines.Count }
+
+        $targets = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($i in $ownLines) { [void]$targets.Add((Get-InfDeviceLine -Line $lines[$i]).Section) }
 
         if ($targets.Count -eq 0) {
             Write-Warning "$($r.Name): none of the whitelisted devices are present. Run Add-ExtraGpuSupport.ps1 first."
@@ -167,24 +193,28 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
             foreach ($f in $Flags) {
                 $have = $false
                 for ($j = $start + 1; $j -lt $end; $j++) {
-                    if ($lines[$j] -match ('^\s*' + [regex]::Escape($f) + '\s*=')) { $have = $true; break }
+                    $body = ($lines[$j] -split ';', 2)[0]
+                    if ($body -match ('^\s*' + [regex]::Escape($f) + '\s*=\s*(\S*)')) {
+                        $have = $true
+                        # Present but switched off (= 0) is the same as absent for the installer.
+                        if ($Matches[1] -ne '1') { $lines[$j] = "$f = 1"; $missing += "$f (was $($Matches[1]))" }
+                        break
+                    }
                 }
                 if (-not $have) { $missing += $f }
             }
             if ($missing.Count -eq 0) { continue }
 
-            $insertAt = $end
-            while ($insertAt -gt $start + 1 -and $lines[$insertAt - 1].Trim() -eq '') { $insertAt-- }
-            foreach ($f in $missing) { $lines.Insert($insertAt, "$f = 1") }
+            # Inside the body, ahead of any trailing blank or comment lines - the shared rule.
+            $insertAt = Get-InfSectionIndex -Lines $lines -HeaderIndex $start -EndIndex $end
+            foreach ($f in @($missing | Where-Object { $_ -notmatch '\(was ' })) { $lines.Insert($insertAt, "$f = 1") }
 
-            $shared = 0
-            if ($usage.ContainsKey($t)) { $shared = $usage[$t] }
-            Write-Host ("  + [$t] gained " + ($missing -join ', ') + "   (section referenced by $shared device line(s))")
+            Write-Host ("  + [$t] gained " + ($missing -join ', '))
             $addedHere += $missing.Count
             $sectionsTouched++
         }
 
-        if ($addedHere -gt 0) {
+        if ($addedHere -gt 0 -or $cloned -gt 0) {
             if ($PSCmdlet.ShouldProcess($r.Path, "Write component feature flags")) {
                 Write-InfLines -Path $r.Path -Lines $lines -State $state
             }

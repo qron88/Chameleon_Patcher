@@ -202,7 +202,7 @@ foreach ($k in $KeepInf) {
     if (-not $k) { continue }
     $want = $k
     if ($want -notlike '*.inf') { $want = $want + '.inf' }
-    $found = @(Resolve-WhitelistInf -DisplayDriverPath $displayDriver -InfName $want)
+    $found = @(Resolve-WhitelistInf -DisplayDriverPath $displayDriver -InfName $want -AllowMany)
     if ($found.Count -eq 0) { Write-Warning "-KeepInf '$k' matches no INF in this package." }
     foreach ($f in $found) { Add-Keep -Name $f.Name -Why "requested with -KeepInf" }
 }

@@ -46,6 +46,17 @@
                                 line never lands outside the section it belongs to
     Test-InfLineContinuations - report backslash continuations inside the sections we patch, which
                                 the per-line matchers cannot see
+    Write-TextFileAtomic      - temp file + File.Replace, so a killed run never leaves half a file
+    Get-SystemToolPath        - full System32 path of certutil/bcdedit, never a PATH lookup
+    Test-ProjectSigningCertificate - is a certificate one this toolkit mints (self-signed, Code
+                                Signing, not a CA, project subject); gates cleanup and trust
+    Import-SigningPfx         - bring a .pfx into Cert:\CurrentUser\My so signing never needs /p
+    Get-CatalogNonMember / Get-InfDeclaredCatalog - catalog membership (wintrust) and the INF to
+                                catalog pairing the INFs themselves declare
+    Test-DriverSource         - is the input NVIDIA's: signed .exe, or a folder its catalog covers
+    Get-InfSectionBody / Merge-InfTemplateWithDonor - bring a captured section template up to date
+                                with the closest stock install section of the release being patched
+    Test-InfRmOverrideLine    - the RM1457588 directive, as patcher and gate both test for it
 
   Resolution is memoized for the lifetime of the dot-sourcing script and re-validated with
   Test-Path on each hit, so an SDK that is updated or removed mid-run cannot leave a stale
@@ -172,8 +183,11 @@ function Find-WdkTool {
 
     $candidates = @()
     foreach ($root in $roots) {
-        if (Test-Path $root) {
-            $candidates += Get-ChildItem -Path $root -Filter $ExeName -Recurse -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $root) {
+            # ARM builds cannot run on an x64 host; without this filter a version folder that ships
+            # x86 and arm64 but no x64 would rank its arm64 copy alongside the x86 one.
+            $candidates += @(Get-ChildItem -LiteralPath $root -Filter $ExeName -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -notmatch '\\arm(64)?\\' })
         }
     }
 
@@ -676,12 +690,15 @@ function Resolve-WhitelistInf {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$DisplayDriverPath,
-        [Parameter(Mandatory = $true)][string]$InfName
+        [Parameter(Mandatory = $true)][string]$InfName,
+        # Return every widened match instead of refusing an ambiguous one. Only for callers that
+        # ask "keep anything named like this" (-KeepInf), never for the patchers or the gate.
+        [switch]$AllowMany
     )
 
     $exact = Join-Path $DisplayDriverPath $InfName
-    if (Test-Path $exact) {
-        return @([PSCustomObject]@{ Path = (Resolve-Path $exact).Path; Name = $InfName; Exact = $true })
+    if (Test-Path -LiteralPath $exact) {
+        return @([PSCustomObject]@{ Path = (Resolve-Path -LiteralPath $exact).Path; Name = $InfName; Exact = $true })
     }
 
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($InfName)
@@ -694,9 +711,17 @@ function Resolve-WhitelistInf {
         $hits = @(Get-ChildItem -LiteralPath $DisplayDriverPath -Filter ($g + '*.inf') -File -ErrorAction SilentlyContinue |
                   Sort-Object Name)
         if ($hits.Count -eq 0) { continue }
-        return @($hits | ForEach-Object {
-            [PSCustomObject]@{ Path = $_.FullName; Name = $_.Name; Exact = $false }
-        })
+        # A widened glob that lands on more than one file is a guess between INFs, and every caller
+        # would patch, check or keep ALL of them - including an OEM INF that merely shares the stem.
+        # Refuse instead of guessing; -KeepInf / an explicit fix to whitelist.json resolves it.
+        if ($hits.Count -gt 1 -and $AllowMany) {
+            return @($hits | ForEach-Object { [PSCustomObject]@{ Path = $_.FullName; Name = $_.Name; Exact = $false } })
+        }
+        if ($hits.Count -gt 1) {
+            throw ("This release has no $InfName, and '$g*.inf' matches several INFs ($(($hits | ForEach-Object { $_.Name }) -join ', ')). " +
+                   "Refusing to guess which one stands in for it - rename the key in whitelist.json to this release's file name.")
+        }
+        return @([PSCustomObject]@{ Path = $hits[0].FullName; Name = $hits[0].Name; Exact = $false })
     }
     return @()
 }
@@ -824,6 +849,42 @@ function Resolve-SigningCertificate {
     return $null
 }
 
+function Import-SigningPfx {
+    <#
+       Put a .pfx's certificate and key into Cert:\CurrentUser\My (non-exportable) and return the store
+       certificate, so signing can always use `signtool /sha1` from the store.
+
+       signtool has no way to read a .pfx password except from its own command line (/p), where every
+       process listing can read it for the length of the call. Importing once removes that route
+       entirely: the password is used here, in-process, and never again. If the key is already in the
+       store, nothing is imported.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$PfxPath,
+        [Parameter(Mandatory = $true)][securestring]$Password
+    )
+    try {
+        $probe = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $PfxPath, $Password,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+    }
+    catch {
+        throw "Could not open $PfxPath with the supplied password - check the password and try again. ($($_.Exception.Message))"
+    }
+    $tp = $probe.Thumbprint
+    $probe.Dispose()
+
+    $inStore = Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+        Where-Object { $_.Thumbprint -eq $tp -and $_.HasPrivateKey } | Select-Object -First 1
+    if ($inStore) { return $inStore }
+
+    Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $Password | Out-Null
+    $imported = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Thumbprint -eq $tp -and $_.HasPrivateKey } | Select-Object -First 1
+    if (-not $imported) { throw "Imported $PfxPath, but its key is not usable from Cert:\CurrentUser\My." }
+    Write-Host "  Imported $(Split-Path $PfxPath -Leaf) into Cert:\CurrentUser\My ($tp, key non-exportable) - later runs need no password." -ForegroundColor Yellow
+    return $imported
+}
+
 function Save-SigningCerIfMissing {
     <#
       Makes sure the public half of a store certificate is on disk as
@@ -871,7 +932,16 @@ function Remove-OldDriverPatchCerts {
     $toRemove = @()
     foreach ($c in @(Get-ChildItem Cert:\CurrentUser\My -ErrorAction SilentlyContinue)) {
         if ($c.Thumbprint.ToUpperInvariant() -eq $keep) { continue }
-        if (Test-DriverPatchSubject $c.Subject) { $toRemove += $c }
+        # Not a subject substring alone: this runs unattended on every pipeline run, so it only ever
+        # touches a self-signed code-signing certificate shaped like the ones this toolkit mints. An
+        # unrelated certificate that merely has "Chameleon" in its name is left alone and reported.
+        if (-not (Test-DriverPatchSubject $c.Subject)) { continue }
+        $why = Test-ProjectSigningCertificate -Certificate $c
+        if ($why) {
+            Write-Host ("  Left alone: " + $c.Thumbprint + " (" + $c.Subject + ") - " + $why + ".") -ForegroundColor DarkGray
+            continue
+        }
+        $toRemove += $c
     }
     if ($toRemove.Count -eq 0) {
         Write-Host "  No old patch certificates to remove from Cert:\CurrentUser\My." -ForegroundColor DarkGray
@@ -1150,7 +1220,33 @@ function Write-InfLines {
     }
     if ($State.EndsWithNewline -and $Lines.Count -gt 0) { [void]$sb.Append($nl) }
 
-    [System.IO.File]::WriteAllText($Path, $sb.ToString(), $State.Encoding)
+    Write-TextFileAtomic -Path $Path -Text $sb.ToString() -Encoding $State.Encoding
+}
+
+function Write-TextFileAtomic {
+    <#
+       Write a whole file so that a reader - or a crash - never sees it half-written: the text goes
+       to a temporary file in the same folder, which then replaces the original in one rename.
+       WriteAllText straight onto an INF truncates it first, and a run killed at that moment left a
+       cut-off INF that the next step happily patched further.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][System.Text.Encoding]$Encoding
+    )
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $tmp = $full + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Text, $Encoding)
+        # [NullString]::Value, not $null: PowerShell would pass $null to a string parameter as "",
+        # which File.Replace rejects as a backup path.
+        if ([System.IO.File]::Exists($full)) { [System.IO.File]::Replace($tmp, $full, [NullString]::Value) }
+        else { [System.IO.File]::Move($tmp, $full) }
+    }
+    finally {
+        if ([System.IO.File]::Exists($tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Write-InfText {
@@ -1165,5 +1261,346 @@ function Write-InfText {
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
         [Parameter(Mandatory = $true)]$State
     )
-    [System.IO.File]::WriteAllText($Path, $Text, $State.Encoding)
+    Write-TextFileAtomic -Path $Path -Text $Text -Encoding $State.Encoding
+}
+
+# --- System tools ----------------------------------------------------------------------------------
+function Get-SystemToolPath {
+    <#
+       Full path of a tool that ships in System32 (certutil.exe, bcdedit.exe). Calling these by bare
+       name resolves through the current directory and PATH first, which in an elevated session is
+       exactly where a planted copy would sit.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $p = Join-Path ([Environment]::GetFolderPath('System')) $Name
+    if (-not (Test-Path -LiteralPath $p)) { throw "$Name not found in $([Environment]::GetFolderPath('System'))." }
+    return $p
+}
+
+# --- Certificate identity --------------------------------------------------------------------------
+function Test-ProjectSigningCertificate {
+    <#
+       Is this certificate one this toolkit could have minted: self-signed (subject = issuer), a
+       Code Signing EKU, not a CA, and a subject in the project's patterns. Anything that fails this
+       is not ours to delete from a store or to trust as a driver-patch certificate - a subject
+       substring alone also matches an unrelated certificate that merely contains "Chameleon".
+       Returns $null when it qualifies, otherwise the reason it does not.
+    #>
+    param([Parameter(Mandatory = $true)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    if (-not (Test-DriverPatchSubject $Certificate.Subject)) { return "its subject matches none of $($script:DriverPatchSubjectPatterns -join ', ')" }
+    if ($Certificate.Subject -ne $Certificate.Issuer) { return "it is not self-signed (issued by $($Certificate.Issuer))" }
+    $eku = @($Certificate.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension] } |
+        ForEach-Object { $_.EnhancedKeyUsages } | ForEach-Object { $_.Value })
+    if ($eku -notcontains '1.3.6.1.5.5.7.3.3') { return "it has no Code Signing EKU" }
+    $bc = @($Certificate.Extensions | Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] })
+    if ($bc.Count -gt 0 -and $bc[0].CertificateAuthority) { return "it is a certificate authority (Basic Constraints CA=true)" }
+    return $null
+}
+
+# --- Catalog membership ----------------------------------------------------------------------------
+# A driver catalog lists its members by hash: the Authenticode hash for a PE file, a flat hash for
+# anything else, written as a hex "member tag". wintrust computes that hash for us, so "is this file
+# covered by that catalog" is one lookup per file, with no signtool process and no trust policy - the
+# question is membership, not whether the catalog's signer is trusted yet.
+if (-not ('ChameleonCatalog' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+public static class ChameleonCatalog {
+    [DllImport("wintrust.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool CryptCATAdminAcquireContext2(out IntPtr phCatAdmin, IntPtr pgSubsystem, string pwszHashAlgorithm, IntPtr pStrongHashPolicy, uint dwFlags);
+    [DllImport("wintrust.dll", SetLastError = true)]
+    static extern bool CryptCATAdminReleaseContext(IntPtr hCatAdmin, uint dwFlags);
+    [DllImport("wintrust.dll", SetLastError = true)]
+    static extern bool CryptCATAdminCalcHashFromFileHandle2(IntPtr hCatAdmin, IntPtr hFile, ref uint pcbHash, byte[] pbHash, uint dwFlags);
+    [DllImport("wintrust.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CryptCATOpen(string pwszFileName, uint fdwOpenFlags, IntPtr hProv, uint dwPublicVersion, uint dwEncodingType);
+    [DllImport("wintrust.dll", SetLastError = true)]
+    static extern bool CryptCATClose(IntPtr hCatalog);
+    [DllImport("wintrust.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CryptCATGetMemberInfo(IntPtr hCatalog, string pwszReferenceTag);
+
+    static string Tag(string algorithm, string file) {
+        IntPtr ctx;
+        if (!CryptCATAdminAcquireContext2(out ctx, IntPtr.Zero, algorithm, IntPtr.Zero, 0)) return null;
+        try {
+            using (FileStream fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                uint size = 64;
+                byte[] hash = new byte[size];
+                if (!CryptCATAdminCalcHashFromFileHandle2(ctx, fs.SafeFileHandle.DangerousGetHandle(), ref size, hash, 0)) return null;
+                return BitConverter.ToString(hash, 0, (int)size).Replace("-", "");
+            }
+        } finally { CryptCATAdminReleaseContext(ctx, 0); }
+    }
+
+    // The files (full paths) the catalog does NOT list, under a SHA256 or a SHA1 member tag.
+    public static string[] FindNonMembers(string catalogPath, string[] files) {
+        IntPtr cat = CryptCATOpen(catalogPath, 4 /* CRYPTCAT_OPEN_EXISTING */, IntPtr.Zero, 0, 0x00010001);
+        if (cat == new IntPtr(-1) || cat == IntPtr.Zero)
+            throw new IOException("Cannot open catalog " + catalogPath + " (error " + Marshal.GetLastWin32Error() + ")");
+        List<string> missing = new List<string>();
+        try {
+            foreach (string f in files) {
+                bool found = false;
+                foreach (string alg in new string[] { "SHA256", "SHA1" }) {
+                    string t = Tag(alg, f);
+                    if (t != null && CryptCATGetMemberInfo(cat, t) != IntPtr.Zero) { found = true; break; }
+                }
+                if (!found) missing.Add(f);
+            }
+        } finally { CryptCATClose(cat); }
+        return missing.ToArray();
+    }
+}
+'@
+}
+
+function Get-CatalogNonMember {
+    <# The subset of -Path (full file paths) that the catalog at -CatalogPath does not list. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$CatalogPath,
+        [string[]]$Path = @()
+    )
+    if ($Path.Count -eq 0) { return @() }
+    return @([ChameleonCatalog]::FindNonMembers((Resolve-Path -LiteralPath $CatalogPath).Path, $Path))
+}
+
+function Get-InfDeclaredCatalog {
+    <#
+       The catalog files the INFs in a folder declare (CatalogFile= and its decorated forms such as
+       CatalogFile.NTamd64=), as a hashtable catalog-name -> list of INF names. This is the real
+       INF-to-catalog pairing; file names do not carry it (all of NVIDIA's display INFs declare
+       NV_DISP.CAT, and no INF is called NV_DISP.inf).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Folder)
+    $map = @{}
+    foreach ($inf in @(Get-ChildItem -LiteralPath $Folder -Filter *.inf -File)) {
+        foreach ($l in @((Get-InfTextFile -Path $inf.FullName).Lines)) {
+            $body = ($l -split ';', 2)[0]
+            if ($body -match '^\s*CatalogFile(\.[A-Za-z0-9_.]+)?\s*=\s*(\S+)\s*$') {
+                $cat = $Matches[2].Trim()
+                if (-not $map.ContainsKey($cat)) { $map[$cat] = New-Object System.Collections.Generic.List[string] }
+                if (-not $map[$cat].Contains($inf.Name)) { $map[$cat].Add($inf.Name) }
+            }
+        }
+    }
+    return $map
+}
+
+function Test-NvidiaSignature {
+    <#
+       $null when the file carries a valid Authenticode signature from NVIDIA - or, unless -NvidiaOnly,
+       from Microsoft - else the reason it does not. Microsoft is accepted for what WHQL signs: a
+       driver catalog is countersigned by "Microsoft Windows Hardware Compatibility Publisher". A driver
+       DOWNLOAD must be NVIDIA's own: without -NvidiaOnly, any Microsoft-signed .exe (cmd.exe, say)
+       would pass as a driver source.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$NvidiaOnly
+    )
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($sig.Status -ne 'Valid') {
+        $who = if ($sig.SignerCertificate) { " (signer: $($sig.SignerCertificate.Subject))" } else { "" }
+        return "signature status is $($sig.Status)$who"
+    }
+    $subject = $sig.SignerCertificate.Subject
+    $isNvidia = $subject -match '(^|,\s*)O=NVIDIA Corporation(,|$)'
+    $isMicrosoft = $subject -match '(^|,\s*)O=Microsoft Corporation(,|$)'
+    if ($NvidiaOnly -and -not $isNvidia) { return "it is validly signed, but by $subject, not by NVIDIA" }
+    if (-not $isNvidia -and -not $isMicrosoft) { return "it is validly signed, but by $subject, not by NVIDIA or Microsoft" }
+    return $null
+}
+
+function Test-DriverSource {
+    <#
+       Is the input to a run genuinely NVIDIA's? This toolkit re-signs whatever it is given with a
+       certificate the machine trusts as a root, so an unverified input is the one thing that turns
+       it into a way of blessing someone else's binaries.
+
+         .exe     The download's own Authenticode signature, which covers the appended 7z archive,
+                  must be valid and NVIDIA's.
+         folder   Every catalog the display INFs declare must carry a valid NVIDIA/WHQL signature,
+                  and every INF and every driver binary (.sys .dll .exe .bin) in Display.Driver must
+                  be a member of one of them - or, for a PE file outside the catalog (installer
+                  plugins), carry a valid NVIDIA/Microsoft signature of its own. A folder that was
+                  already patched fails here by design: its INFs no longer match NVIDIA's catalog.
+
+       Returns @{ Ok; Problems; Notes }. Never throws for a verdict; callers decide.
+    #>
+    param(
+        [string]$ExePath,
+        [string]$PackagePath
+    )
+    $problems = New-Object System.Collections.Generic.List[string]
+    $notes = New-Object System.Collections.Generic.List[string]
+
+    if ($ExePath) {
+        $why = Test-NvidiaSignature -Path $ExePath -NvidiaOnly
+        if ($why) { $problems.Add("$(Split-Path $ExePath -Leaf): $why") }
+        else { $notes.Add("$(Split-Path $ExePath -Leaf): valid NVIDIA signature") }
+    }
+    else {
+        $dd = Join-Path $PackagePath 'Display.Driver'
+        $catalogs = Get-InfDeclaredCatalog -Folder $dd
+        if ($catalogs.Count -eq 0) { $problems.Add("No INF in $dd declares a catalog (CatalogFile=).") }
+        $signedCats = @()
+        foreach ($name in $catalogs.Keys) {
+            $cp = Join-Path $dd $name
+            if (-not (Test-Path -LiteralPath $cp -PathType Leaf)) { $problems.Add("$name is declared by $($catalogs[$name].Count) INF(s) but is not a file in the folder."); continue }
+            $why = Test-NvidiaSignature -Path $cp
+            if ($why) { $problems.Add("${name}: $why"); continue }
+            $signedCats += (Resolve-Path -LiteralPath $cp).Path
+        }
+        if ($signedCats.Count -gt 0) {
+            $files = @(Get-ChildItem -LiteralPath $dd -File -Recurse | Where-Object { $_.Extension -notmatch '^\.(cat|nvi)$' } | ForEach-Object { $_.FullName })
+            $left = $files
+            foreach ($c in $signedCats) { $left = @(Get-CatalogNonMember -CatalogPath $c -Path $left) }
+            $unverified = @()
+            foreach ($f in $left) {
+                if ($f -match '\.(inf|sys)$') { $problems.Add("$($f.Substring($dd.Length + 1)) is not covered by NVIDIA's catalog - modified or foreign."); continue }
+                if ($f -match '\.(dll|exe|bin)$') {
+                    $why = Test-NvidiaSignature -Path $f
+                    if ($why) { $problems.Add("$($f.Substring($dd.Length + 1)) is outside NVIDIA's catalog and $why.") }
+                    continue
+                }
+                $unverified += $f.Substring($dd.Length + 1)
+            }
+            $notes.Add("$($files.Count - $left.Count) of $($files.Count) Display.Driver files covered by NVIDIA's signed catalog.")
+            if ($unverified.Count) { $notes.Add("Data files no signature covers (installer metadata): $($unverified -join ', ')") }
+        }
+    }
+    return [PSCustomObject]@{ Ok = ($problems.Count -eq 0); Problems = $problems; Notes = $notes }
+}
+
+# --- INF section model for the template/donor merge ------------------------------------------------
+function Get-InfSectionBody {
+    <#
+       Section name (case-insensitive) -> the section's non-empty lines with comments stripped and
+       whitespace trimmed. Duplicate headers are merged, as Windows merges them.
+    #>
+    param([Parameter(Mandatory = $true)]$Lines)
+    $map = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[string]]' ([StringComparer]::OrdinalIgnoreCase)
+    $cur = $null
+    foreach ($raw in $Lines) {
+        $h = $script:InfSectionHeaderRx.Match([string]$raw)
+        if ($h.Success) {
+            $cur = $h.Groups[1].Value.Trim()
+            if (-not $map.ContainsKey($cur)) { $map[$cur] = New-Object System.Collections.Generic.List[string] }
+            continue
+        }
+        if (-not $cur) { continue }
+        $t = (([string]$raw) -split ';', 2)[0].Trim()
+        if ($t) { $map[$cur].Add($t) }
+    }
+    return $map
+}
+
+function Get-InfDirectiveKey {
+    <#
+       What a directive line is FOR, independent of NVIDIA's per-release section numbering:
+       "CopyFiles = nv_ngx_builtins_copyfiles__01" -> "copyfiles|nv_ngx_builtins_copyfiles". Two lines
+       with the same key do the same job for different chip families; a key one side lacks is a job
+       that side does not do at all. Returns $null for a line that is not a section-referencing directive.
+    #>
+    param([string]$Line)
+    if ($Line -notmatch '^(AddReg|DelReg|CopyFiles|DelFiles|RenFiles|AddService|DelService|Include|Needs|CopyINF|AddProperty|AddSoftware)\s*=\s*(.+)$') { return $null }
+    $d = $Matches[1].ToLowerInvariant()
+    $first = (($Matches[2] -split ',')[0]).Trim()
+    return $d + '|' + ($first -replace '__\d+$', '').ToLowerInvariant()
+}
+
+function Merge-InfTemplateWithDonor {
+    <#
+       Bring a section family captured in whitelist.json (from an older driver) up to date with the
+       driver it is being spliced into.
+
+       The captured bodies name sections by NVIDIA's numbering at capture time and, worse, only the
+       jobs that existed then: a stock 621.24 install section copies nv_ngx_builtins_copyfiles__01,
+       which the captured 595.79 body has never heard of, so a spliced device installed without those
+       files. The donor is the stock install section of THIS INF whose lines are closest to the
+       template (Jaccard over the trimmed lines, at least -MinSimilarity). Every section-referencing
+       directive the donor carries for a job the template does not do is appended to the matching
+       member of the family; a companion section (.Services, .HW, ...) the donor has and the template
+       lacks is taken whole. Feature flags (NVSupport* = ...) are never taken from the donor - those
+       are per-GPU decisions, and Enable-OptionalComponents.ps1 owns them.
+
+       Returns @{ Family (ordered suffix -> string[]); Donor; Similarity; Added (string[]) }. With no
+       donor close enough, the template is returned unchanged and Donor is $null.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$TemplateFamily,
+        [Parameter(Mandatory = $true)]$Sections,
+        [string[]]$InstallSections = @(),
+        [double]$MinSimilarity = 0.8
+    )
+    $family = [ordered]@{}
+    if ($TemplateFamily -is [System.Collections.IDictionary]) {
+        foreach ($k in $TemplateFamily.Keys) { $family[$k] = @($TemplateFamily[$k] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+    }
+    else {
+        foreach ($p in $TemplateFamily.PSObject.Properties) { $family[$p.Name] = @($p.Value | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) }
+    }
+    $base = @($family['_base'])
+
+    $donor = $null; $best = -1.0
+    $baseSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($l in $base) { [void]$baseSet.Add($l) }
+    foreach ($s in $InstallSections) {
+        if (-not $Sections.ContainsKey($s)) { continue }
+        $other = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($l in $Sections[$s]) { [void]$other.Add($l) }
+        $inter = 0
+        foreach ($l in $other) { if ($baseSet.Contains($l)) { $inter++ } }
+        $union = $baseSet.Count + $other.Count - $inter
+        $j = if ($union -gt 0) { $inter / $union } else { 0 }
+        if ($j -gt $best) { $best = $j; $donor = $s }
+    }
+    $added = New-Object System.Collections.Generic.List[string]
+    if (-not $donor -or $best -lt $MinSimilarity) {
+        return [PSCustomObject]@{ Family = $family; Donor = $null; Similarity = [math]::Max($best, 0); Added = @() }
+    }
+
+    # Every member of the donor's family: the base section plus "<donor>.<suffix>" companions.
+    $donorFamily = [ordered]@{ '_base' = @($Sections[$donor]) }
+    foreach ($name in $Sections.Keys) {
+        if ($name.StartsWith($donor + '.', [StringComparison]::OrdinalIgnoreCase)) {
+            $donorFamily[$name.Substring($donor.Length + 1)] = @($Sections[$name])
+        }
+    }
+    foreach ($suffix in @($donorFamily.Keys)) {
+        $dBody = @($donorFamily[$suffix])
+        $tKey = @($family.Keys | Where-Object { $_ -eq $suffix })
+        if ($tKey.Count -eq 0) {
+            $family[$suffix] = $dBody
+            foreach ($l in $dBody) { $added.Add("[.$suffix] $l") }
+            continue
+        }
+        $tBody = @($family[$tKey[0]])
+        $have = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($l in $tBody) { $k = Get-InfDirectiveKey $l; if ($k) { [void]$have.Add($k) } }
+        $extra = @()
+        foreach ($l in $dBody) {
+            $k = Get-InfDirectiveKey $l
+            if ($k -and -not $have.Contains($k)) { $extra += $l; [void]$have.Add($k) }
+        }
+        if ($extra.Count) {
+            $family[$tKey[0]] = @($tBody + $extra)
+            $label = if ($suffix -eq '_base') { '' } else { "[.$suffix] " }
+            foreach ($l in $extra) { $added.Add($label + $l) }
+        }
+    }
+    return [PSCustomObject]@{ Family = $family; Donor = $donor; Similarity = $best; Added = @($added) }
+}
+
+function Test-InfRmOverrideLine {
+    <#
+       Does this INF line actually write the RM1457588 override - an HKR AddReg entry on the non-comment
+       part of the line, rather than the bare text anywhere (a comment mentioning it used to count)?
+    #>
+    param([string]$Line)
+    $body = (([string]$Line) -split ';', 2)[0]
+    return ($body -match '^\s*HKR\s*,\s*,\s*RM1457588\s*,')
 }

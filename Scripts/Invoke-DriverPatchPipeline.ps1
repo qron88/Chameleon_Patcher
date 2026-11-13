@@ -174,6 +174,16 @@ param(
     # so the SDK/7-Zip rules are not duplicated in C# where they can drift from the pipeline.
     [switch]$CheckPatchTools,
 
+    # Print whether the source is genuinely NVIDIA's (SOURCE_OK / SOURCE_UNTRUSTED + detail) and
+    # stop. The GUI asks this so it can offer to continue with an unverified source.
+    [switch]$CheckSource,
+
+    # Patch a source that is not verifiably NVIDIA's: an .exe without a valid NVIDIA signature, or a
+    # folder whose files NVIDIA's signed catalog does not cover (e.g. one already patched). The
+    # output is re-signed with a certificate your machine trusts, so only pass this for a source
+    # you trust for some other reason.
+    [switch]$SkipSourceVerification,
+
     [string[]]$KeepInf = @(),
 
     [switch]$SkipOptionalComponents,
@@ -199,6 +209,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# UTF-8 on stdout. A redirected, windowless powershell.exe otherwise writes in the console's OEM
+# codepage (852 on a Polish system) while the GUI reads UTF-8: a path with a non-ASCII character
+# came back from -ShowOutputPath with U+FFFD in it, and that mangled path became -OutputPath.
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
 # $PSScriptRoot is unreliable inside a param() default value under Windows PowerShell when the
@@ -215,9 +230,9 @@ if (-not $WhitelistPath) {
 # process actually uses. Interactive use (running this script directly) is unaffected: the
 # prompt below only fires when this isn't set.
 #
-# This is now only consulted on the .pfx FALLBACK path. When the signing key is in
-# Cert:\CurrentUser\My (the normal case) no password is involved at any point, and the GUI does
-# not set this variable at all.
+# This is only consulted on the .pfx path. When the signing key is in Cert:\CurrentUser\My (the
+# normal case) no password is involved at any point, and the GUI does not set this variable at all.
+# It is read and removed from this process's environment before anything else runs.
 if (-not $PfxPassword -and $env:DRIVER_PATCH_PFX_PASSWORD) {
     $PfxPassword = ConvertTo-SecureString $env:DRIVER_PATCH_PFX_PASSWORD -AsPlainText -Force
     # Gone again the moment it has become a SecureString. A process's environment block is readable
@@ -280,6 +295,11 @@ if ($CheckPatchTools) {
     return
 }
 
+function Get-SourceReport {
+    if ($SourceExePath) { return (Test-DriverSource -ExePath $SourceExePath) }
+    return (Test-DriverSource -PackagePath $SourcePackagePath)
+}
+
 if ([bool]$SourceExePath -eq [bool]$SourcePackagePath) {
     throw @"
 Pass exactly one of -SourceExePath or -SourcePackagePath, not both/neither.
@@ -326,7 +346,15 @@ if ($ShowOutputPath) {
     return
 }
 
-if (Test-Path $OutputPath) {
+if ($CheckSource) {
+    $src = Get-SourceReport
+    if ($src.Ok) { Write-Output 'SOURCE_OK' } else { Write-Output 'SOURCE_UNTRUSTED' }
+    foreach ($p in $src.Problems) { Write-Output "  $p" }
+    foreach ($n in $src.Notes) { Write-Output "  $n" }
+    return
+}
+
+if (Test-Path -LiteralPath $OutputPath) {
     throw "Output path already exists: $OutputPath`nRemove it or pass a different -OutputPath - this script never overwrites a previous run."
 }
 
@@ -376,6 +404,23 @@ What you probably want instead:
     Write-Host ""
 }
 
+# --- Gate: is the source genuinely NVIDIA's? ---------------------------------------------------
+# Everything this run produces is re-signed with a certificate the machine trusts as a root, so the
+# input is checked before anything else is spent on it: an .exe by its own Authenticode signature
+# (which covers the appended archive), a folder by NVIDIA's signed catalog.
+if ($SkipSourceVerification) {
+    Write-Warning "Source verification skipped (-SkipSourceVerification): this run will re-sign whatever the source contains."
+}
+else {
+    Write-Host "Verifying the source is NVIDIA's..." -ForegroundColor DarkGray
+    $src = Get-SourceReport
+    foreach ($n in $src.Notes) { Write-Host "  $n" -ForegroundColor DarkGray }
+    if (-not $src.Ok) {
+        throw ("The source is not verifiably NVIDIA's, so it will not be patched and re-signed:`n  " + ($src.Problems -join "`n  ") +
+               "`nUse the original download from nvidia.com. If you trust this source for another reason, re-run with -SkipSourceVerification.")
+    }
+}
+
 # --- Preflight -------------------------------------------------------------------------------
 # Resolve every external tool AND the signing identity before unpacking or copying anything.
 # Both used to be discovered late, which meant a missing SDK or an unavailable signing key only
@@ -408,6 +453,7 @@ $cerCandidates = Get-SigningCerCandidates -CertificatesDir $certificatesDir -Pfx
 # caller has said which certificate to use.
 $signingCert = Resolve-SigningCertificate -Thumbprint $CertThumbprint -CerPathCandidates $cerCandidates -SearchStore:(-not $PfxPath)
 $generateNewCert = $false
+$importedFromPfx = $false
 
 if ($signingCert) {
     Write-Host "  cert:     $($signingCert.Thumbprint) (from certificate store - no password needed)" -ForegroundColor Green
@@ -430,17 +476,12 @@ Fix it once and every future run becomes passwordless:
             }
             $PfxPassword = Read-Host -AsSecureString -Prompt "Password for $PfxPath"
         }
-        # Fail now, not after the copy, if the password is wrong. EphemeralKeySet avoids
-        # persisting the key into the user's on-disk key container just to validate it.
-        try {
-            $probe = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-                $PfxPath, $PfxPassword,
-                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
-            $probe.Dispose()
-        }
-        catch {
-            throw "Could not open $PfxPath with the supplied password - check the password and try again. ($($_.Exception.Message))"
-        }
+        # Import once, now: a wrong password fails before the copy, and signing then runs from the
+        # store like every other run - signtool's /f /p form would put the password on its command
+        # line for every process listing to read.
+        $signingCert = Import-SigningPfx -PfxPath $PfxPath -Password $PfxPassword
+        $importedFromPfx = $true
+        $PfxPassword = $null
     }
     else {
         # Nothing to validate and nothing to ask for: the new certificate's key is created
@@ -472,9 +513,7 @@ else {
     Step-Banner "Copying package"
     Write-Host "  $SourcePackagePath"
     Write-Host "  -> $OutputPath"
-    Copy-Item -Path $SourcePackagePath -Destination $OutputPath -Recurse
-    Get-ChildItem -Path $OutputPath -Filter ".claude" -Directory -Recurse -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Copy-Item -LiteralPath $SourcePackagePath -Destination $OutputPath -Recurse
 }
 
 # Whitelist INFs the prune step removed on purpose. The later steps warn about a whitelist INF
@@ -543,6 +582,7 @@ if ($signingCert) {
     Write-Host "    Subject:    $($signingCert.Subject)"
     Write-Host "    Thumbprint: $($signingCert.Thumbprint)"
     Write-Host "    Expires:    $($signingCert.NotAfter)"
+    if ($importedFromPfx) { Write-Host "  (imported from $PfxPath during preflight)" -ForegroundColor DarkGray }
     Write-Host "  (remove it from Cert:\CurrentUser\My, or pass -CertThumbprint, to use a different one)" -ForegroundColor DarkGray
     # Found through the store search rather than a .cer file: put its public half back on disk so
     # Approve-DriverPatchCert.ps1 and the next run find it the ordinary way.
@@ -568,26 +608,16 @@ elseif ($generateNewCert) {
     Write-Host "  NOTE: this new certificate is not trusted yet, so the driver will not load until" -ForegroundColor Yellow
     Write-Host "  you run Approve-DriverPatchCert.ps1 (elevated) and enable Test Signing mode." -ForegroundColor Yellow
 }
-else {
-    Write-Host "  Using certificate file: $PfxPath"
-    Write-Host "  One-time fix to make all future runs passwordless:" -ForegroundColor DarkGray
-    Write-Host "    Import-PfxCertificate -FilePath `"$PfxPath`" -CertStoreLocation Cert:\CurrentUser\My" -ForegroundColor DarkGray
-}
 
 Step-Banner "Rebuilding + signing catalog"
+# Always from the store: a .pfx was imported during preflight, so no password travels any further.
 $signArgs = @{
     DisplayDriverPath = (Join-Path $OutputPath "Display.Driver")
     Inf2CatPath       = $tools.Inf2Cat
     SignToolPath      = $tools.SignTool
     SkipTimestamp     = $SkipTimestamp
     NonInteractive    = $NonInteractive
-}
-if ($signingCert) {
-    $signArgs['CertThumbprint'] = $signingCert.Thumbprint
-}
-else {
-    $signArgs['PfxPath']     = $PfxPath
-    $signArgs['PfxPassword'] = $PfxPassword
+    CertThumbprint    = $signingCert.Thumbprint
 }
 & (Join-Path $PSScriptRoot "Sign-DriverPackage.ps1") @signArgs
 
@@ -605,6 +635,10 @@ if ($signingCert -and -not $KeepAllOldCerts) {
     if ($generateNewCert) {
         Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it minted a new certificate." -ForegroundColor DarkGray
     }
+    elseif ($importedFromPfx) {
+        # A key brought in from another PC's .pfx must never cost this PC its own non-exportable key.
+        Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it signed with an imported .pfx." -ForegroundColor DarkGray
+    }
     else {
         Remove-OldDriverPatchCerts -KeepThumbprint $signingCert.Thumbprint
     }
@@ -612,28 +646,15 @@ if ($signingCert -and -not $KeepAllOldCerts) {
 
 if (-not $SkipSetupCertOption) {
     Step-Banner "Adding opt-in cert-trust option to installer"
-    # Add-SetupCertOption.ps1 needs the public .cer, not the .pfx - export it fresh from whatever
-    # cert is actually in use rather than assuming a same-named .cer sits next to it. Exporting
-    # the PUBLIC half of a store certificate needs no password at all; the .pfx branch below is
-    # only reached when signing fell back to a certificate file.
-    $disposeCertObj = $false
-    if ($signingCert) {
-        $certObj = $signingCert
-    }
-    else {
-        $certObj = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
-            $PfxPath, $PfxPassword,
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
-        $disposeCertObj = $true
-    }
+    # Add-SetupCertOption.ps1 needs the public .cer - exported fresh from the certificate that
+    # actually signed, rather than assuming a same-named .cer sits next to it. No password needed.
     $tempCerPath = Join-Path ([System.IO.Path]::GetTempPath()) "GpuUnlockCert_$([guid]::NewGuid()).cer"
-    [System.IO.File]::WriteAllBytes($tempCerPath, $certObj.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    [System.IO.File]::WriteAllBytes($tempCerPath, $signingCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
     try {
         & (Join-Path $PSScriptRoot "Add-SetupCertOption.ps1") -PackageRoot $OutputPath -CerPath $tempCerPath
     }
     finally {
-        Remove-Item $tempCerPath -ErrorAction SilentlyContinue
-        if ($disposeCertObj) { $certObj.Dispose() }
+        Remove-Item -LiteralPath $tempCerPath -ErrorAction SilentlyContinue
     }
 }
 

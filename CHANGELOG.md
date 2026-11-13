@@ -5,9 +5,149 @@ All notable changes to Project Chameleon are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The version is declared in the assembly attributes at the top of `Source\Chameleon-Patcher.cs`
-and nowhere else; see [Version](README.md#version).
+and nowhere else; see [Version](README.md#version). Design notes and measurements that used to
+be in the README are under [Reference notes](#reference-notes) at the end of this file.
 
 ## [Unreleased]
+
+## [1.0.6] - 2026-11-13
+
+### Security
+
+- **The source has to be NVIDIA's.** Every run re-signs its input with a certificate the machine
+  trusts as a root, so the input is now verified before anything is unpacked or copied
+  (`Test-DriverSource` in `PatchToolDiscovery.ps1`). An `.exe` needs a valid Authenticode signature
+  from NVIDIA (it covers the appended 7z archive). A folder needs every catalog its display INFs
+  declare to carry a valid NVIDIA/WHQL signature, and every INF and driver binary to be a member of
+  one - or, for an installer plugin outside the catalog, a valid NVIDIA/Microsoft signature of its
+  own. Catalog membership is checked through wintrust (`CryptCATAdminCalcHashFromFileHandle2` +
+  `CryptCATGetMemberInfo`), about 20 s for a 2.7 GB `Display.Driver`. Of the six packages in
+  `Drivers\`, the two signed `CN=FrankenDriver` (528.24, 610.47) are refused; a folder with one
+  hand-edited INF is refused. `-SkipSourceVerification` overrides it, `-CheckSource` answers
+  `SOURCE_OK` / `SOURCE_UNTRUSTED` without running anything, and the GUI asks before overriding.
+- **No password on any command line.** A `.pfx` is now imported into `Cert:\CurrentUser\My` once
+  (key non-exportable, `Import-SigningPfx`) and signing always runs `signtool /sha1` from the store.
+  The `signtool /f <pfx> /p <password>` route is gone. A run that signed with an imported `.pfx`
+  skips the old-key cleanup, so a foreign key can never cost this PC its own non-exportable one.
+- **Certificates are recognised by identity, not by a name substring.** `Test-ProjectSigningCertificate`
+  requires self-signed, Code Signing EKU, not a CA, and a project subject. The automatic cleanup of
+  `Cert:\CurrentUser\My`, `Remove-DriverPatchCert.ps1 -AllPatchCerts` and
+  `Approve-DriverPatchCert.ps1` all use it, so a third-party certificate that merely contains
+  "Chameleon" or "Driver Patch" is neither deleted nor trusted. `-Thumbprint` still removes anything
+  named explicitly.
+- **New certificates are explicitly not CAs.** `New-DriverSigningCert.ps1` adds a critical Basic
+  Constraints `CA=false`, so a certificate sitting in `Root` cannot vouch for other certificates.
+- **No bare tool names in privileged places.** The GUI starts `System32\WindowsPowerShell\v1.0\powershell.exe`
+  by full path (with `UseShellExecute=false` a bare name is looked up in the application folder
+  first); `certutil.exe` and `bcdedit.exe` are called by full System32 path (`Get-SystemToolPath`).
+  The GUI's "open download page" button only opens `https://` addresses.
+- `Approve-DriverPatchCert.ps1` warns when Test Signing is off on the current boot and prints the
+  thumbprint next to a prompt to compare it with the signing run's.
+
+### Fixed
+
+- **Spliced install sections were missing what newer releases install.** The section bodies in
+  `whitelist.json` were captured from 595.79; a stock 621.24 install section also carries
+  `CopyFiles = nv_ngx_builtins_copyfiles__01`, so every device added from the template installed
+  without those files. `Merge-InfTemplateWithDonor` now picks the closest stock install section of
+  the INF being patched (Jaccard over its lines, >= 0.8) and appends every section-referencing
+  directive it carries for a job the template does not do (keyed on the directive and the section
+  family with its `__NN` number stripped), plus any companion section the template lacks. Feature
+  flags are never copied. The gate asks the same question the other way round and fails on a spliced
+  section that lacks such a job: on 621.24 the 1.0.5 patcher's output fails with 48 findings (47 in
+  `nv_dispi.inf`, 1 in `nvami.inf`), 1.0.6's passes.
+- **PhysX / NVIDIA App flags no longer spill onto other GPUs.** `Enable-OptionalComponents.ps1`
+  edited a reused stock install section in place even when NVIDIA's own device lines also used it -
+  on 621.24 that is `Section017` in `nv_dispi.inf` and `Section139` / `Section141` in `nvami.inf`.
+  Such a section is now cloned as `<section>_ChameleonOpt` (with its companions) and only the
+  whitelisted lines point at the clone. A flag present as `= 0` is switched to `1` instead of
+  counting as present. Section headers go through the shared pattern and insertion through
+  `Get-InfSectionIndex`.
+- **The GUI read the pipeline's output in the wrong encoding.** A windowless redirected
+  `powershell.exe` writes in the OEM codepage (852 on a Polish system) and the GUI decodes UTF-8, so a
+  path with `Ł` came back from `-ShowOutputPath` with U+FFFD and became `-OutputPath`. The pipeline
+  now sets `[Console]::OutputEncoding` to UTF-8; verified round-trip with a `Łodz_żtest` folder.
+- **The last lines of a failed run could be missing from the log.** `Process.Exited` can fire before
+  the asynchronous stdout/stderr readers drain; the handler now calls the parameterless
+  `WaitForExit()` first, so the closing error message - and the phrase that reopens the `.pfx`
+  fields - are always seen.
+- **The GUI only deletes an output folder that looks like one.** Before `Directory.Delete` the path
+  reported by the pipeline must sit beside the source and end in `_Patched` / contain `_Patched_`.
+- **Catalogs are paired by `CatalogFile=`, not by file name**, and after signing every INF is
+  checked to be a member of the catalog it declares (`Get-InfDeclaredCatalog`,
+  `Get-CatalogNonMember`). A `.cat` no INF declares is reported and left unsigned.
+- **The RM override is matched as a directive.** Patcher and gate both use `Test-InfRmOverrideLine`
+  (`HKR,,RM1457588,` on the non-comment part of a line); a comment that mentions the value no longer
+  satisfies either.
+- **The gate also audits stock sections** that whitelisted device lines point at, not only the
+  spliced `SectionExtraGPU*` families.
+- **An ambiguous INF rename stops the run.** If the widened `<stem>*.inf` / `<stem minus one>*.inf`
+  lookup matches more than one file, `Resolve-WhitelistInf` throws instead of patching all of them;
+  `-KeepInf` keeps its "anything named like this" meaning through `-AllowMany`.
+- Spliced section names are checked against every section already in the file, so a re-run or a
+  later entry can no longer merge two install sections under one name.
+- **Package files are written atomically** (`Write-TextFileAtomic`: temp file in the same folder,
+  then `File.Replace`), so a killed run cannot leave a truncated INF.
+- `Find-WdkTool` ignores ARM builds of `signtool.exe` / `Inf2Cat.exe`.
+- The RM override's per-section "next header" lookup was a pipeline filter over every header -
+  quadratic on 3,000-section OEM INFs; it is a single precomputed map now.
+- The GUI's tool check allows 120 s (the SDK search alone could exceed the old 20 s bound, and a
+  timed-out check was silently skipped).
+- `[Strings]` descriptions with a `"` are escaped by doubling it.
+- The gate printed a stray `0` (the unused return value of `Test-InfLineContinuations`).
+- The README said the `.pfx` password variable stayed in the child's environment for the whole run;
+  the pipeline has removed it before doing anything else since 1.0.5.
+
+- **A driver download must be NVIDIA's own.** The signature check accepted Microsoft-signed files
+  too (WHQL countersigns NVIDIA's catalogs), so any Microsoft-signed `.exe` - `cmd.exe`, say - passed
+  as a driver source. `.exe` sources now require NVIDIA (`Test-NvidiaSignature -NvidiaOnly`); catalogs
+  and installer plugins still accept either. Found while writing the tests below.
+
+### Added
+
+- **The Pester suites are back** (`Tests\`, deleted in `71ea1de`): 76 tests, ~5 s, Pester 3.4 as
+  shipped with Windows PowerShell 5.1, run with `.\Tests\Run.ps1` (exit code = failures). The
+  recovered `InfPatchIntegrity` suite passed unchanged; `PatchToolDiscovery` had stopped loading
+  because it imported functions of the unpack route 1.0.5 removed - those four blocks are gone, and
+  new ones cover the rename ambiguity, atomic and byte-faithful writes (BOM + LF, ANSI), the RM
+  directive test, the template/donor merge, certificate identity (certificates built in memory, no
+  store touched), catalog membership (`New-FileCatalog`), source verification and System32 paths.
+  The integration suite gained a fixture shaped like a real release, so the donor merge, the
+  stale-section gate, the shared-section clone, the RM-in-a-comment case and name collisions run
+  end to end. Restoring them also caught a defect in the old fixture (a stock section referencing a
+  missing `[Section001.CopyFiles]`), which the gate's new stock-section audit now reports.
+- **`AGENTS.md`**: why each mechanism exists, for reviewers - human or model - before they propose
+  removing one.
+
+### Removed
+
+- `signtool /f /p` signing, and the informational `signtool verify /pa` call.
+- Deleting `.claude` folders from a copied package (a leftover of a development tool).
+
+### Reviewed
+
+- Security and correctness reviewed against the threat model in `AGENTS.md`. All 76 Pester tests pass.
+  No mechanism flagged as a potential weakness is removable without breaking the design goal: the
+  self-signed catalog must load under Test Signing with the certificate chained to `LocalMachine\Root`,
+  source must be NVIDIA's, passwords never reach a command line, certificates are recognised by identity
+  not by a name substring, and new certificates are explicitly not CAs.
+
+### Verified
+
+Every run below used the NVIDIA-signed `.exe`, passed the gate, signed `NV_DISP.CAT` and confirmed
+every INF is a member of it:
+
+| Release | Build | Entries | RM sections | Donor lines added | Shared sections cloned | Time |
+|---|---|---|---|---|---|---|
+| 616.92 Studio (`nv_dispsi.inf`, `nvamsi.inf`) | universal, 45 INFs | 61/61 | 1533/1533 in 43 INFs | 0 | 3 | ~55 min |
+| 617.42 | pruned to 1 INF | 58/58 | 17/17 | 0 | 1 | ~2.5 min |
+| 621.01 | pruned to 1 INF | 58/58 | 17/17 | 47 sections (`nv_ngx_builtins_copyfiles__01`) | 1 | ~2.5 min |
+| 621.24 | pruned to 1 INF | 58/58 | 17/17 | 47 sections (`nv_ngx_builtins_copyfiles__01`) | 1 | 2.5 min |
+
+`nv_ngx_builtins_copyfiles` first appears between 617.42 and 621.01, which is exactly the kind of
+drift the captured templates could not follow.
+- Not verified: an actual driver install on hardware. Nothing in this release changes what the
+  patched driver does on a whitelisted GPU except the added `CopyFiles` lines, which match stock.
 
 ## [1.0.5] - 2026-10-23
 
@@ -497,3 +637,190 @@ than a change against a previous published version.
   nothing, the keep set stayed empty, and all 45 display INFs were deleted - leaving a 3.6 GB
   package containing no INF and reporting `Manifest and disk agree: 0 INF(s) each` on the way
   out. The guard now re-asserts after the fallback and refuses to prune instead.
+
+## Reference notes
+
+Material that used to live in the README, moved here in 1.0.6 and brought up to date with it. The
+release entries above say what changed; these notes say how things work and why.
+
+### Running the steps by hand
+
+`cd Scripts`, then in this order - the gate has to come after every step that edits INFs, and
+signing last, because `Add-RmCapabilityOverride.ps1` and `Enable-OptionalComponents.ps1` change
+files that are hashed into the catalog:
+
+```powershell
+.\Unpack-DriverExe.ps1            -ExePath "621.24-....exe" -OutputPath "621.24_Patched"
+.\Add-ExtraGpuSupport.ps1         -DisplayDriverPath "621.24_Patched\Display.Driver"
+.\Add-RmCapabilityOverride.ps1    -DisplayDriverPath "621.24_Patched\Display.Driver"
+.\Enable-OptionalComponents.ps1   -PackageRoot "621.24_Patched"
+.\Test-DriverPatch.ps1            -DisplayDriverPath "621.24_Patched\Display.Driver"   # -ReportOnly to look without failing
+.\New-DriverSigningCert.ps1
+.\Sign-DriverPackage.ps1          -DisplayDriverPath "621.24_Patched\Display.Driver"
+.\Add-SetupCertOption.ps1         -PackageRoot "621.24_Patched" -CerPath "..\Certificates\DriverPatchSigning_<thumbprint>.cer"
+```
+
+The standalone scripts do not verify the source; `Invoke-DriverPatchPipeline.ps1` does.
+
+### Coverage
+
+`whitelist.json` carries 61 entries covering 51 PCI device IDs: 35 under `SUBSYS_000010DE`, 3
+`SUBSYS_44494D50`, 3 `SUBSYS_00000000`, 16 with no subsystem (any subsystem of that device), and 4
+specific OEM subsystems (MSI, ASUS, Lenovo). Blackwell (RTX 50) is out of scope: the one entry,
+`DEV_2D00` under a null subsystem, is unlikely to match real hardware. End-to-end runs: 616.86,
+616.92 Studio, 617.14, 617.42, 621.01, 621.24. A release nobody has run is unverified; on one, watch
+the gate's `N/N` line and any "this release has no X.inf" note.
+
+### INF renames
+
+`whitelist.json` is keyed by INF file name, and NVIDIA renames them per build: 616.86 desktop-notebook
+appends `g` (`nv_dispig.inf`, `nvamig.inf`), 616.92 Studio replaces the last letter with `si`
+(`nv_dispsi.inf`, `nvamsi.inf`), 581.94 uses the ordinary names. `Resolve-WhitelistInf` resolves a key
+in three tiers - exact name, `<stem>*.inf`, `<stem minus its last character>*.inf` (core of at least
+four characters) - and reports every substitution. Since 1.0.6 a widened tier that matches more than
+one file is an error rather than a guess. A rename beyond a shared core makes the patcher throw with
+"whitelist.json needs updating".
+
+### The verification gate
+
+`Test-DriverPatch.ps1` runs between patching and signing and asserts, per INF named in the
+whitelist (exact or renamed): at least one `[NVIDIA_Devices*]` block; every entry's DEV/SUBSYS in
+every block (a `...&REV_A1` line counts only for that revision; trailing comments ignored); each
+device line's install section exists; every `%token%` is defined in `[Strings]`; the references of
+spliced `SectionExtraGPU*` families and of stock sections whitelisted lines point at resolve; no
+spliced family lacks a job its closest stock section does; every `nv_miscBase_addreg__NN` section
+writes `RM1457588`. A whitelist INF missing for any reason other than `-PrunedInf` is an error.
+`CopyINF`/`Include` targets outside `Display.Driver` (`nvppc.inf`, `nvpcf.inf`) are informational.
+
+Known limit: every matcher reads one physical line at a time. Trailing-backslash continuations
+inside the patched sections are reported with their line numbers as a warning, not folded.
+
+### Build for this PC only (`-PruneForeignOemInfs`)
+
+`Inf2Cat` re-validates the whole folder per INF and its cost is superlinear in INF count, unaffected
+by the `/os` list (measured on a 2.71 GB `Display.Driver`: 1 INF 79.7 s, 2 INFs 128.1 s, 4 INFs
+147.4 s, 8 INFs 583.8 s). All INFs declare `CatalogFile = NV_DISP.CAT`, so the build cannot be split.
+Measured on 616.86: unpruned ~57 min (catalog ~3000 s), pruned to 2 INFs 7.6 min, to 1 INF 2.2 min.
+Trimming whitelist entries makes no difference.
+
+An INF survives the prune if it can match a GPU present (exact DEV+SUBSYS, a bare DEV line, or a line
+with extra qualifiers, which is kept to be safe), if it is a whitelist INF with an entry naming
+present hardware, or if `-KeepInf` names it. Multi-GPU machines keep the union; the HD Audio function
+is ignored. Safety rules:
+
+- Preflight refuses a pruned build when no GPU here is one the whitelist unlocks
+  (`-AllowUnsupportedGpu` overrides; an unreadable GPU only warns).
+- Pruning to zero INFs throws, whatever emptied the keep set.
+- Pruned INFs move to a staging folder and the `.nvi` manifest is edited as text; any failure before
+  the manifest/disk cross-check moves them back and restores the manifest bytes. Afterwards the
+  deletion is final.
+- Kept INFs are scanned for `Include=` / `Needs=` / `CopyINF=` naming a pruned INF (literal names,
+  one physical line at a time, `Display.Driver` only).
+- Companions of a pruned INF (its own `.cat`) stay on disk and in the manifest; no INF declares
+  them, so the signing step leaves them unsigned.
+
+### PhysX and the NVIDIA App
+
+`setup.cfg` offers "PhysX System Software" and the NVIDIA App only when the device's INF install
+section carries `NVSupportPhysx = 1` / `NVSupportGFExperienceUDA = 1` (the constraints are
+`level="silent"`, so a missing flag hides the row without a message). In stock 616.64's main INF,
+55 of 105 install sections carry the PhysX flag and 28 the App flag. `Enable-OptionalComponents.ps1`
+sets both on the sections the whitelisted devices use (cloning a section NVIDIA's own devices share)
+and makes `Display.NvApp` user-selectable. It never deletes the `setup.cfg` constraints, which would
+force the components on for every GPU. Not confirmed through a real install.
+
+### Why VRAM / compute needs RM1457588
+
+Symptom without it: the driver installs on a whitelisted GPU, but VRAM is misreported and
+CUDA/NVENC/OptiX do not work. The driver performs a second, Resource-Manager-level hardware check
+beyond the INF whitelist. In stock 595.79, `nvmsoai.inf` (MSI OEM) carries
+`HKR,,RM1457588,%REG_DWORD%,1` in both its `nv_miscBase_addreg__NN` sections, and the key name also
+appears in `nvlddmkm.sys` and the `gsp_*.bin` images. That also explains the old "install the
+hand-patched driver first" workaround: a driver update does not clear per-device values the new INF
+does not mention. The override is added to every misc section of every INF rather than to the ones
+the whitelisted sections reference - resolving that per release was judged more fragile, and the
+key has had no observed effect on hardware that passes the check anyway. Narrowing it needs a
+hardware test that has not been done.
+
+### Signing identity
+
+`signtool /sha1 <thumbprint>` signs from `Cert:\CurrentUser\My`, where `New-SelfSignedCertificate`
+leaves the key, so the machine that minted the certificate never needs a password. Resolution order:
+`-CertThumbprint`; the `.cer` files in `Certificates\` (`DriverPatchSigning_<thumbprint>.cer` newest
+first, then the legacy `DriverPatchSigning.cer`) whose key is in the store and unexpired; a store
+search by subject (project certificate with key and time left, one trusted in `LocalMachine\Root`
+first, then the latest expiry - this stops a deleted `Certificates\` folder from causing a new key
+and the cleanup of the old one); then a `.pfx` (imported) or a newly minted certificate.
+`Approve-DriverPatchCert.ps1` uses only the `.cer` list, deliberately: a target PC has the `.cer`
+and no key. `Add-SetupCertOption.ps1` binds the embedded `.cer` to the certificate that actually
+signed `NV_DISP.CAT` and throws on a mismatch. To check a package by hand:
+
+```powershell
+Get-AuthenticodeSignature "<pkg>\Display.Driver\NV_DISP.CAT" | Select-Object -ExpandProperty SignerCertificate | Select-Object Thumbprint, Subject
+```
+
+Timestamping is best-effort; an un-timestamped signature stops validating when the certificate
+expires (3 years from minting by default).
+
+`New-DriverSigningCert.ps1` names the `.cer`/`.pfx` after the thumbprint and never overwrites
+either; it refuses to mint a second *valid* certificate under a subject already in the store
+(`-Force` overrides; an expired namesake does not block). The default subject is
+`CN=Chameleon Project - Customised driver for Nvidia GPU`; a subject cannot be changed afterwards.
+The subject patterns the toolkit recognises (`*Chameleon*`, `*Driver Patch*`, `*FrankenDriver*`)
+must only ever be extended, or older certificates become invisible to resolution and cleanup.
+
+### Certificate cleanup
+
+After a successful signing run the pipeline removes other project certificates from
+`Cert:\CurrentUser\My`, keeping the one it signed with (`-KeepAllOldCerts` opts out; skipped when
+the run minted a new certificate or signed with an imported `.pfx`). This withdraws no trust.
+Withdrawing trust is `Remove-DriverPatchCert.ps1`'s job: read-only by default; `-Thumbprint`,
+or `-AllPatchCerts -KeepThumbprint`; `-Scope CurrentUser|LocalMachine|Both`; `-IncludePrivateKeys`
+also removes cert+key pairs from `My` (irreversible for a non-exportable key, and under `Both` that
+includes `LocalMachine\My`). `CurrentUser` trust stores are a merged view - an entry inherited from
+`LocalMachine` cannot be deleted there; the script says so and prints the elevated command. There is
+deliberately no `CA` store entry (a self-signed certificate is its own root); any found is removed.
+
+### Installing and checking catalogs
+
+`pnputil` and `setup.exe` pick catalogs by what the INFs declare. To see what is signed:
+
+```powershell
+Get-ChildItem "<name>_Patched\Display.Driver" -Filter *.cat | ForEach-Object {
+    $s = Get-AuthenticodeSignature $_.FullName
+    "{0,-24} {1,-10} {2}" -f $_.Name, $s.Status, $(if ($s.SignerCertificate) { $s.SignerCertificate.Thumbprint } else { "(unsigned)" })
+}
+```
+
+The declared `NV_DISP.CAT` should show your thumbprint; leftovers of pruned INFs keep NVIDIA's
+(now invalid) signature and are not used. The installer's cert row adds the certificate to `Root`
+and `TrustedPublisher` before `Display.Driver` installs (`disposition="default"`, ticked;
+`-Unchecked` starts it unticked); the row's rendering is confirmed, a full ticked install is not.
+Alternative to Test Signing: Shift+Restart > Troubleshoot > Startup Settings > Disable driver
+signature enforcement, for one boot.
+
+### The GUI
+
+`Chameleon-Patcher.exe` (WinForms, .NET Framework 4.x) runs the pipeline as a child
+`powershell.exe -NonInteractive` and follows its `=== N/M: ... ===` banners. Before a run it asks the
+pipeline: `-CheckSource` (and offers `-SkipSourceVerification` for an untrusted source),
+`-CheckLocalGpuSupport` for a pruned build (offering the portable build instead), `-ShowOutputPath`,
+and `-CheckPatchTools` (refusing with download buttons when a tool is missing). A `.pfx` password
+travels in the child's environment (`DRIVER_PATCH_PFX_PASSWORD`), which the pipeline reads and
+removes before anything else; it is never on a command line or in a log. The GUI recognises the
+`.pfx` failure by the phrase `none was supplied and prompting is disabled` - keep that wording in
+`Invoke-DriverPatchPipeline.ps1` and `Sign-DriverPackage.ps1`. Closing mid-run asks, then kills the
+whole child tree (`taskkill /T`) and records it; the output folder is left incomplete.
+
+Logs: `Logs\patch-YYYYMMDD-HHMMSS.log` beside the `.exe` (fallbacks: `%LOCALAPPDATA%`, `%TEMP%`),
+flushed per line, with tool version, Windows build, elevation, inputs, the child command line, every
+output line with elapsed time, exit code and duration; the 20 newest are kept. A terminal run is not
+logged: `... *> patch.log`.
+
+### Version policy
+
+`AssemblyVersion` stays at `x.y.0.0`; `AssemblyFileVersion` / `AssemblyInformationalVersion` carry
+the release. The scripts are read from `Scripts\` at run time, so a run is identified by the `.exe`
+version plus the revision of `Scripts\` beside it - commit the rebuilt `.exe` with the scripts.
+`Build.ps1` writes to the project root on purpose (the app finds `Scripts\` relative to itself) and
+embeds `Assets\Chameleon.ico`.

@@ -21,8 +21,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.5.0")]
-[assembly: AssemblyInformationalVersion("1.0.5")]
+[assembly: AssemblyFileVersion("1.0.6.0")]
+[assembly: AssemblyInformationalVersion("1.0.6")]
 
 namespace ChameleonPatcherGui
 {
@@ -91,6 +91,12 @@ namespace ChameleonPatcherGui
         internal static MainForm Live;
 
         private const string PreparingText = "Checking...";
+
+        // Full path, never a bare "powershell.exe": with UseShellExecute=false, CreateProcess looks in
+        // this application's own folder first, so a powershell.exe dropped next to the patcher would
+        // run instead of Windows' own. This process is x64, so SystemDirectory is the real System32.
+        private static readonly string PowerShellExe =
+            Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
 
         /// <summary>
         /// Records a crash that escaped a handler and shows one readable dialog. Called by the
@@ -519,7 +525,41 @@ namespace ChameleonPatcherGui
         /// </summary>
         private string CheckPatchToolsQuery()
         {
-            return QueryPipeline("-CheckPatchTools", null, false, false);
+            // The SDK search walks Windows Kits recursively; on a cold disk that alone can take longer
+            // than the default bound, and a timed-out query silently skipped this check.
+            return QueryPipeline("-CheckPatchTools", null, false, false, 120000);
+        }
+
+        /// <summary>
+        /// Asks the pipeline whether the source is genuinely NVIDIA's (-CheckSource). An untrusted
+        /// source gets one explicit question; answering yes is the only way the GUI passes
+        /// -SkipSourceVerification. Returns null to stop, otherwise the extra arguments to pass.
+        /// </summary>
+        private async Task<string> ConfirmSourceAsync(string driverPath, bool isExe)
+        {
+            lblStep.Text = "Verifying the driver is NVIDIA's...";
+            // A folder is checked file by file against NVIDIA's catalog - tens of seconds.
+            string stdout = await Task.Run(() => QueryPipeline("-CheckSource", driverPath, isExe, false, 600000));
+            if (closing || IsDisposed) return null;
+            if (stdout == null) return "";   // Unanswerable here: the pipeline checks again and stops on its own.
+
+            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length == 0 || lines[0].Trim() != "SOURCE_UNTRUSTED") return "";
+
+            var detail = new StringBuilder();
+            for (int i = 1; i < lines.Length && i <= 8; i++) detail.AppendLine(lines[i].Trim());
+            var answer = MessageBox.Show(
+                this,
+                "This driver is not verifiably NVIDIA's:\n\n" + detail +
+                "\nThe patcher re-signs everything in it with a certificate your PC trusts as a root, " +
+                "so a modified or repackaged driver would be trusted too.\n\n" +
+                "Use the original download from nvidia.com unless you trust this file for another reason.\n\n" +
+                "Continue with this file anyway?",
+                "Unverified driver source",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            return answer == DialogResult.Yes ? " -SkipSourceVerification" : null;
         }
 
         /// <summary>
@@ -612,6 +652,9 @@ namespace ChameleonPatcherGui
                         {
                             string url = line.Trim();
                             if (url.Length == 0) continue;
+                            // The text comes from the child's stdout; only ever hand the shell a web
+                            // address, never a path or a command that happens to sit on that line.
+                            if (!url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) continue;
                             try
                             {
                                 // A URL handed to Process.Start goes through the shell, so whatever the
@@ -756,7 +799,7 @@ namespace ChameleonPatcherGui
         /// -CheckLocalGpuSupport) and returns its stdout, or null if the question could not be
         /// answered. Those modes touch nothing on disk, so this is safe to call before a run.
         /// </summary>
-        private string QueryPipeline(string queryArgs, string driverPath, bool isExe, bool prune)
+        private string QueryPipeline(string queryArgs, string driverPath, bool isExe, bool prune, int timeoutMs = 20000)
         {
             string pipelineScript = Path.Combine(scriptsDir, "Invoke-DriverPatchPipeline.ps1");
             if (!File.Exists(pipelineScript)) return null;
@@ -774,7 +817,7 @@ namespace ChameleonPatcherGui
 
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "powershell.exe",
+                    FileName = PowerShellExe,
                     Arguments = args.ToString(),
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
@@ -795,7 +838,7 @@ namespace ChameleonPatcherGui
                     // already exited, so a timeout checked afterwards can never fire.
                     var stdoutTask = proc.StandardOutput.ReadToEndAsync();
                     var stderrTask = proc.StandardError.ReadToEndAsync();
-                    if (!proc.WaitForExit(20000))
+                    if (!proc.WaitForExit(timeoutMs))
                     {
                         KillProcessTree(proc);
                         return null;
@@ -839,6 +882,31 @@ namespace ChameleonPatcherGui
                 if (candidate.Length > 0 && Path.IsPathRooted(candidate)) return candidate;
             }
             return fallback;
+        }
+
+        /// <summary>
+        /// True when <paramref name="outputPath"/> is a folder the pipeline could have created for
+        /// this source: same parent folder, a leaf ending in "_Patched" or containing "_Patched_",
+        /// and not the source itself.
+        /// </summary>
+        private static bool IsPlausibleOutputFolder(string outputPath, string driverPath)
+        {
+            try
+            {
+                string outFull = Path.GetFullPath(outputPath).TrimEnd('\\');
+                string srcFull = Path.GetFullPath(driverPath).TrimEnd('\\');
+                if (string.Equals(outFull, srcFull, StringComparison.OrdinalIgnoreCase)) return false;
+                string outParent = Path.GetDirectoryName(outFull);
+                string srcParent = Path.GetDirectoryName(srcFull);
+                if (outParent == null || !string.Equals(outParent, srcParent, StringComparison.OrdinalIgnoreCase)) return false;
+                string leaf = Path.GetFileName(outFull);
+                return leaf.EndsWith("_Patched", StringComparison.OrdinalIgnoreCase) ||
+                       leaf.IndexOf("_Patched_", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>
@@ -1282,6 +1350,11 @@ namespace ChameleonPatcherGui
             // fails with an explanatory message instead of blocking on a prompt this GUI cannot
             // answer.
 
+            // Is this NVIDIA's own driver? Asked first: nothing else is worth spending on a source the
+            // user decides not to trust, and the answer may add -SkipSourceVerification.
+            string sourceArgs = await ConfirmSourceAsync(driverPath, isExe);
+            if (sourceArgs == null) return;
+
             // Ask about a for-this-PC-only build BEFORE the output path is resolved: answering
             // "build the portable one" unticks the checkbox, and that changes the folder name.
             if (!await ConfirmPrunedBuildIsWorthItAsync()) return;
@@ -1295,6 +1368,17 @@ namespace ChameleonPatcherGui
 
             if (Directory.Exists(outputPath))
             {
+                // The path came back from a child process's stdout. Before it can drive a recursive
+                // delete it has to look like what the pipeline names its output: a "*_Patched" or
+                // "*_Patched_<GPU>" folder beside the source, never the source itself.
+                if (!IsPlausibleOutputFolder(outputPath, driverPath))
+                {
+                    MessageBox.Show(this,
+                        "The output folder the pipeline reported does not look like a patch output folder:\n" + outputPath +
+                        "\n\nNothing was deleted. Remove or rename it yourself if it is safe to do so.",
+                        "Unexpected output folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
                 if (!chkOverwrite.Checked)
                 {
                     MessageBox.Show(
@@ -1472,6 +1556,7 @@ namespace ChameleonPatcherGui
             // prompt would hang forever with the GUI showing no reason why; -NonInteractive
             // turns any such case into a clear error we surface in the log instead.
             argsBuilder.Append(" -NonInteractive");
+            argsBuilder.Append(sourceArgs);
             // -PfxPassword is deliberately never passed on the command line, where any process
             // listing or event log could read it. When a password is actually needed it travels
             // in an environment variable set only on the child process (see RunPipelineAsync).
@@ -1641,7 +1726,7 @@ namespace ChameleonPatcherGui
 
             var psi = new ProcessStartInfo
             {
-                FileName = "powershell.exe",
+                FileName = PowerShellExe,
                 Arguments = arguments,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
@@ -1694,8 +1779,15 @@ namespace ChameleonPatcherGui
             };
             process.Exited += (s, e) =>
             {
-                LogLine("[exit]", "child process exited with code " + process.ExitCode);
-                tcs.TrySetResult(process.ExitCode);
+                // Exited can fire while the last lines of the redirected streams are still queued -
+                // and those are usually the error message, plus the phrase that sets
+                // pfxPasswordWasRequired. The parameterless WaitForExit returns only once both
+                // asynchronous readers have reached end of stream.
+                try { process.WaitForExit(); } catch { }
+                int code = -1;
+                try { code = process.ExitCode; } catch { }
+                LogLine("[exit]", "child process exited with code " + code);
+                tcs.TrySetResult(code);
             };
 
             try

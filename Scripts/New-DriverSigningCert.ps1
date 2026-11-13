@@ -122,7 +122,10 @@ $cert = New-SelfSignedCertificate `
     -KeyUsage DigitalSignature `
     -KeyExportPolicy $keyPolicy `
     -NotAfter (Get-Date).AddYears($ValidityYears) `
-    -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3")   # Extended Key Usage: Code Signing
+    -TextExtension @(
+        "2.5.29.37={text}1.3.6.1.5.5.7.3.3",     # Extended Key Usage: Code Signing only
+        "2.5.29.19={critical}{text}ca=0")        # Basic Constraints: NOT a CA - once it sits in Root
+                                                 # it must not be able to vouch for other certificates
 
 # Named with the thumbprint so every minted certificate has its own unambiguous public file.
 # The legacy fixed name DriverPatchSigning.cer is no longer written here: overwriting it on
