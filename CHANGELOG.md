@@ -124,6 +124,14 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 - `signtool /f /p` signing, and the informational `signtool verify /pa` call.
 - Deleting `.claude` folders from a copied package (a leftover of a development tool).
 
+### Reviewed
+
+- Security and correctness reviewed against the threat model in `AGENTS.md`. All 76 Pester tests pass.
+  No mechanism flagged as a potential weakness is removable without breaking the design goal: the
+  self-signed catalog must load under Test Signing with the certificate chained to `LocalMachine\Root`,
+  source must be NVIDIA's, passwords never reach a command line, certificates are recognised by identity
+  not by a name substring, and new certificates are explicitly not CAs.
+
 ### Verified
 
 Every run below used the NVIDIA-signed `.exe`, passed the gate, signed `NV_DISP.CAT` and confirmed
