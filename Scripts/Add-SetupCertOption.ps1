@@ -83,8 +83,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
 $setupCfgPath = Join-Path $PackageRoot "setup.cfg"
-if (-not (Test-Path $setupCfgPath)) { throw "setup.cfg not found under $PackageRoot" }
-if (-not (Test-Path $CerPath)) { throw "Certificate not found: $CerPath" }
+if (-not (Test-Path -LiteralPath $setupCfgPath)) { throw "setup.cfg not found under $PackageRoot" }
+if (-not (Test-Path -LiteralPath $CerPath)) { throw "Certificate not found: $CerPath" }
 # --- Bind the certificate to the package's own signature -----------------------------------------
 # This option ends with the certificate in LocalMachine\Root and TrustedPublisher, which decides
 # what ALL software on the machine accepts afterwards, not just this driver. If the .cer handed in
@@ -93,7 +93,7 @@ if (-not (Test-Path $CerPath)) { throw "Certificate not found: $CerPath" }
 # nothing downstream ever complains. The package itself already states who signed it, so read that
 # and refuse on a mismatch instead of trusting whatever .cer happened to be on the command line.
 $displayDriver = Join-Path $PackageRoot "Display.Driver"
-$catalogs = @(Get-ChildItem -Path $displayDriver -Filter "nv_disp*.cat" -File -ErrorAction SilentlyContinue)
+$catalogs = @(Get-ChildItem -LiteralPath $displayDriver -Filter "nv_disp*.cat" -File -ErrorAction SilentlyContinue)
 if ($catalogs.Count -eq 0) {
     Write-Warning "No nv_disp*.cat under $displayDriver, so the certificate cannot be checked against this package's signature. Embedding $(Split-Path $CerPath -Leaf) unverified; the catalogs are normally signed before this step."
 }
@@ -151,7 +151,7 @@ $cfgOriginalBytes = [System.IO.File]::ReadAllBytes($setupCfgPath)
 # missing, which breaks the installer. So the risky window is the cheap one - and the old
 # "folder exists, refuse" guard turned that harmless leftover into a hard block that needed manual
 # cleanup before the step could be retried.
-$dirPresent = Test-Path $componentDir
+$dirPresent = Test-Path -LiteralPath $componentDir
 $cfgPresent = $cfg -match 'name\s*=\s*"GpuUnlockCert"'
 
 if ($dirPresent -and $cfgPresent) {
@@ -167,7 +167,7 @@ if ($dirPresent -and -not $cfgPresent) {
 Write-Host "Adding GpuUnlockCert component to $PackageRoot" -ForegroundColor Cyan
 
 $templatePath = Join-Path $PSScriptRoot "templates\GpuUnlockCert.nvi.template"
-if (-not (Test-Path $templatePath)) { throw "Template not found: $templatePath" }
+if (-not (Test-Path -LiteralPath $templatePath)) { throw "Template not found: $templatePath" }
 
 # Defined BEFORE the if/else below, not inside the else-branch: the structural verification after
 # the commit compares the written disposition against this variable, and it runs on BOTH paths -
@@ -217,12 +217,18 @@ $indentUnit = if ($childIndent -match "`t") { "`t" } else { "    " }
 $deeperIndent = $childIndent + $indentUnit
 $packageLine = '<package package="GpuUnlockCert" type="after"/>'
 
-# Display.Driver may already carry a <dependencies> block (other sub-packages in this file do).
-# Add to it in that case rather than emitting a second, sibling <dependencies>.
-$afterOpenTag = $cfg.Substring($ddMatch.Index + $ddMatch.Length)
-if ($afterOpenTag -match '^<dependencies\s*>') {
-    $insertAt = $ddMatch.Index + $ddMatch.Length + $Matches[0].Length
-    $cfg = $cfg.Substring(0, $insertAt) + $deeperIndent + $packageLine + $cfg.Substring($insertAt)
+# Display.Driver may already carry a <dependencies> block (other sub-packages in this file do), and
+# it need not be the first child. Add to it wherever it sits inside this sub-package rather than
+# emitting a second, sibling <dependencies>.
+$bodyStart = $ddMatch.Index + $ddMatch.Length
+$ddEnd = $cfg.IndexOf('</sub-package>', $bodyStart)
+if ($ddEnd -lt 0) { $ddEnd = $cfg.Length }
+$depMatch = [regex]::Match($cfg.Substring($bodyStart, $ddEnd - $bodyStart), '(\s*)<dependencies\s*>')
+if ($depMatch.Success) {
+    $insertAt = $bodyStart + $depMatch.Index + $depMatch.Length
+    $depIndent = if ($depMatch.Groups[1].Length -gt 0) { $depMatch.Groups[1].Value } else { $childIndent }
+    $depDeeper = $depIndent + $indentUnit
+    $cfg = $cfg.Substring(0, $insertAt) + $depDeeper + $packageLine + $cfg.Substring($insertAt)
     Write-Host "  Display.Driver already had a <dependencies> block - added the GpuUnlockCert entry to it." -ForegroundColor DarkGray
 }
 else {
@@ -241,14 +247,14 @@ $createdDir = $false
 $wroteCfg = $false
 
 try {
-    if (-not (Test-Path $componentDir)) {
+    if (-not (Test-Path -LiteralPath $componentDir)) {
         New-Item -ItemType Directory -Path $componentDir | Out-Null
         $createdDir = $true
     }
     # -Force so a leftover folder from an interrupted run is refreshed rather than colliding.
-    Copy-Item -Path $CerPath -Destination (Join-Path $componentDir "GpuUnlockCert.cer") -Force
+    Copy-Item -LiteralPath $CerPath -Destination (Join-Path $componentDir "GpuUnlockCert.cer") -Force
     $nviDest = Join-Path $componentDir "GpuUnlockCert.nvi"
-    Copy-Item -Path $templatePath -Destination $nviDest -Force
+    Copy-Item -LiteralPath $templatePath -Destination $nviDest -Force
     # The component declares its disposition in two places, its own .nvi and the setup.cfg
     # sub-package. Keep them in step rather than betting on which one the installer prefers.
     if ($Unchecked) {
@@ -287,7 +293,7 @@ try {
         throw "GpuUnlockCert has disposition='$($declared.disposition)' but '$disposition' was intended."
     }
     foreach ($needed in @("GpuUnlockCert.cer", "GpuUnlockCert.nvi")) {
-        if (-not (Test-Path (Join-Path $componentDir $needed))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $componentDir $needed))) {
             throw "$needed is missing from $componentDir after the copy."
         }
     }

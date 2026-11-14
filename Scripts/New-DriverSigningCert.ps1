@@ -75,7 +75,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $OutputDir) {
     $OutputDir = Join-Path (Split-Path $PSScriptRoot -Parent) "Certificates"
 }
-if (-not (Test-Path $OutputDir)) {
+if (-not (Test-Path -LiteralPath $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
 

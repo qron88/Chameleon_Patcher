@@ -475,3 +475,93 @@ Describe 'Spliced section names never collide (1.0.6)' {
     }
     finally { Remove-ScratchDir -Path $fx.Root }
 }
+
+
+Describe 'Package path containing wildcard characters (1.0.7)' {
+    # "[1]" is what a browser appends to a duplicate download. Path parameters used to go through
+    # Test-Path / Get-ChildItem / Resolve-Path without -LiteralPath, which read it as a character class.
+    $fx = New-FixturePackage -Hint 'br[1]'
+    try {
+        It 'patches and certifies a package whose folder name has [ ] in it' {
+            & (Join-Path $script:ScriptsDir 'Add-ExtraGpuSupport.ps1') -DisplayDriverPath $fx.Driver -WhitelistPath $fx.Whitelist | Out-Null
+            & (Join-Path $script:ScriptsDir 'Add-RmCapabilityOverride.ps1') -DisplayDriverPath $fx.Driver | Out-Null
+            & (Join-Path $script:ScriptsDir 'Enable-OptionalComponents.ps1') -PackageRoot $fx.Root -WhitelistPath $fx.Whitelist -WarningAction SilentlyContinue | Out-Null
+            $run = Invoke-Gate -Driver $fx.Driver -Whitelist $fx.Whitelist
+            $run.Threw | Should BeNullOrEmpty
+            $run.Text | Should Match 'PASSED'
+        }
+    }
+    finally { Remove-ScratchDir -Path $fx.Root }
+}
+
+Describe 'Feature flags NVIDIA already set on a shared section (1.0.7)' {
+    # Only "= 0" is switched off. NVIDIA also ships other values (NVSupportGFExperienceUDA = 11 on 38
+    # stock sections); those used to be flattened to "= 1" with their comment dropped.
+    $fx = New-FixturePackage -Hint 'flags'
+    try {
+        $lines = [System.Collections.Generic.List[string]]([System.IO.File]::ReadAllLines($fx.Inf))
+        $at = $lines.IndexOf('[Section001]') + 1
+        $lines.Insert($at, 'NVSupportGFExperienceUDA = 11 ; nvidia decision')
+        $lines.Insert($at, 'NVSupportPhysx = 0 ; was off')
+        [System.IO.File]::WriteAllLines($fx.Inf, [string[]]$lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+        $wl = (Get-Content -LiteralPath $fx.Whitelist -Raw).Replace('"2E46"', '"2704"').Replace('NVIDIA_DEV.2E46', 'NVIDIA_DEV.2704X')
+        [System.IO.File]::WriteAllText($fx.Whitelist, $wl, (New-Object System.Text.UTF8Encoding($false)))
+        & (Join-Path $script:ScriptsDir 'Add-ExtraGpuSupport.ps1') -DisplayDriverPath $fx.Driver -WhitelistPath $fx.Whitelist | Out-Null
+        & (Join-Path $script:ScriptsDir 'Enable-OptionalComponents.ps1') -PackageRoot $fx.Root -WhitelistPath $fx.Whitelist -WarningAction SilentlyContinue | Out-Null
+        $out = [System.IO.File]::ReadAllLines($fx.Inf)
+        $c = @(Get-SectionRanges -Lines $out -HeaderRegex '^\[Section001_ChameleonOpt\]$')[0]
+        $body = $out[($c.Start + 1)..($c.End - 1)]
+
+        It 'switches a flag that is 0 to 1' {
+            ($body -contains 'NVSupportPhysx = 1') | Should Be $true
+        }
+        It 'leaves a flag NVIDIA set to another value exactly as shipped' {
+            ($body -contains 'NVSupportGFExperienceUDA = 11') | Should Be $true
+            (@($body | Where-Object { $_ -match '^NVSupportGFExperienceUDA' })).Count | Should Be 1
+        }
+    }
+    finally { Remove-ScratchDir -Path $fx.Root }
+}
+
+Describe 'Installer cert option when Display.Driver already has a <dependencies> block (1.0.7)' {
+    $dir = New-ScratchDir -Hint 'setupcfg'
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $dir 'Display.Driver') -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $dir 'dummy.cer'), 'x')
+        $cfg = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<setup>'
+            '	<install>'
+            '		<sub-package name="Display.Driver" disposition="critical">'
+            '			<properties>'
+            '			</properties>'
+            '			<dependencies>'
+            '				<package package="Other" type="before"/>'
+            '			</dependencies>'
+            '		</sub-package>'
+            '	</install>'
+            '</setup>'
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText((Join-Path $dir 'setup.cfg'), $cfg, (New-Object System.Text.UTF8Encoding($false)))
+        & (Join-Path $script:ScriptsDir 'Add-SetupCertOption.ps1') -PackageRoot $dir -CerPath (Join-Path $dir 'dummy.cer') -WarningAction SilentlyContinue | Out-Null
+        $xml = New-Object System.Xml.XmlDocument
+        $xml.Load((Join-Path $dir 'setup.cfg'))
+
+        It 'adds the dependency to the existing block instead of a second one' {
+            $dd = $xml.SelectSingleNode("//sub-package[@name='Display.Driver']")
+            @($dd.SelectNodes('dependencies')).Count | Should Be 1
+            @($dd.SelectNodes("dependencies/package[@package='GpuUnlockCert']")).Count | Should Be 1
+            @($dd.SelectNodes("dependencies/package[@package='Other']")).Count | Should Be 1
+        }
+    }
+    finally { Remove-ScratchDir -Path $dir }
+}
+
+Describe 'Tool report for an already-unpacked source (1.0.7)' {
+    It 'does not ask for a 7z CLI when the source is a folder' {
+        $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $report = & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $script:ScriptsDir 'Invoke-DriverPatchPipeline.ps1') -CheckPatchTools -SourcePackagePath 'C:\anything' 2>$null
+        ($report -join "`n") | Should Match '(?m)^\s*7z:\s+NOT NEEDED\s*$'
+        ($report -join "`n") | Should Not Match 'NOT FOUND\s*\r?\n\s*7z'
+    }
+}

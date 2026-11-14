@@ -279,16 +279,22 @@ if ($CheckPatchTools) {
     # tool that can rebuild nv_disp.cat after the INFs are edited, signtool is the only thing that
     # can sign what it rebuilds, and a 7z-compatible CLI is the only thing that unpacks the download
     # this toolkit starts from. Each one that is missing gets its install command printed below.
+    # The 7z CLI is only needed to unpack an .exe: when the query names an already-unpacked folder
+    # (-SourcePackagePath, as the GUI passes it) the real run never calls it, so it is reported as
+    # NOT NEEDED instead of refusing a run that would have worked.
     $inf2cat  = $null; $signtool = $null; $seven = $null
+    $needSeven = -not $SourcePackagePath
     $missingHard = @()
     try { $inf2cat  = Find-WdkTool -ExeName 'Inf2Cat.exe' }  catch { $missingHard += 'Inf2Cat.exe' }
     try { $signtool = Find-WdkTool -ExeName 'signtool.exe' } catch { $missingHard += 'signtool.exe' }
-    try { $seven = Find-SevenZip } catch { $seven = $null; $missingHard += '7z' }
+    if ($needSeven) {
+        try { $seven = Find-SevenZip } catch { $seven = $null; $missingHard += '7z' }
+    }
 
     if ($missingHard.Count -gt 0) { Write-Output 'TOOLS_MISSING' } else { Write-Output 'TOOLS_OK' }
     Write-Output ("  Inf2Cat:  " + $(if ($inf2cat) { $inf2cat } else { 'NOT FOUND' }))
     Write-Output ("  signtool: " + $(if ($signtool) { $signtool } else { 'NOT FOUND' }))
-    Write-Output ("  7z:       " + $(if ($seven) { $seven } else { 'NOT FOUND' }))
+    Write-Output ("  7z:       " + $(if (-not $needSeven) { 'NOT NEEDED' } elseif ($seven) { $seven } else { 'NOT FOUND' }))
     foreach ($m in $missingHard) {
         foreach ($h in (Get-MissingToolHelp -ToolNames @($m))) { Write-Output $h }
     }
@@ -319,7 +325,7 @@ if ($PruneForeignOemInfs) { $outputSuffix = "_Patched_" + (Get-LocalGpuTag) }
 
 $usingExe = [bool]$SourceExePath
 if ($usingExe) {
-    $SourceExePath = (Resolve-Path $SourceExePath).Path
+    $SourceExePath = (Resolve-Path -LiteralPath $SourceExePath).Path
     if (-not $OutputPath) {
         $parent = Split-Path $SourceExePath -Parent
         $leaf = [System.IO.Path]::GetFileNameWithoutExtension($SourceExePath)
@@ -327,7 +333,7 @@ if ($usingExe) {
     }
 }
 else {
-    $SourcePackagePath = (Resolve-Path $SourcePackagePath).Path
+    $SourcePackagePath = (Resolve-Path -LiteralPath $SourcePackagePath).Path
     if (-not (Test-DriverPackageRoot $SourcePackagePath)) {
         throw "`"$SourcePackagePath`" doesn't look like an unpacked driver package root (expected setup.exe, setup.cfg, and a Display.Driver folder)."
     }
@@ -459,10 +465,10 @@ if ($signingCert) {
     Write-Host "  cert:     $($signingCert.Thumbprint) (from certificate store - no password needed)" -ForegroundColor Green
 }
 else {
-    if (-not $PfxPath -and (Test-Path $defaultPfx)) { $PfxPath = $defaultPfx }
+    if (-not $PfxPath -and (Test-Path -LiteralPath $defaultPfx)) { $PfxPath = $defaultPfx }
 
     if ($PfxPath) {
-        if (-not (Test-Path $PfxPath)) { throw "Pfx not found: $PfxPath" }
+        if (-not (Test-Path -LiteralPath $PfxPath)) { throw "Pfx not found: $PfxPath" }
         Write-Host "  cert:     $PfxPath (private key not in this machine's store, so its password is required)" -ForegroundColor Yellow
         if (-not $PfxPassword) {
             if ($NonInteractive) {
@@ -528,7 +534,7 @@ if ($PruneForeignOemInfs) {
     # patch, the RM override, the verification gate and above all the catalog rebuild. Measured on
     # 616.86, pruning 43 INFs down to 2 took the rebuild from ~3000 s to 385 s.
     $displayDriverDir = Join-Path $OutputPath "Display.Driver"
-    $whitelistInfNames = @((Get-Content $WhitelistPath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+    $whitelistInfNames = @((Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
     $presentBeforePrune = @($whitelistInfNames | Where-Object {
         @(Resolve-WhitelistInf -DisplayDriverPath $displayDriverDir -InfName $_).Count -gt 0 })
 
@@ -594,7 +600,7 @@ if ($signingCert) {
 }
 elseif ($generateNewCert) {
     Write-Host "  No certificate found - generating a new one in $certificatesDir"
-    if (-not (Test-Path $certificatesDir)) {
+    if (-not (Test-Path -LiteralPath $certificatesDir)) {
         New-Item -ItemType Directory -Path $certificatesDir -Force | Out-Null
     }
     # No password: the key is created non-exportable and stays in Cert:\CurrentUser\My, so there

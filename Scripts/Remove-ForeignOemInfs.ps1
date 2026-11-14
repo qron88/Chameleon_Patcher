@@ -80,15 +80,15 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
 if (-not $WhitelistPath) { $WhitelistPath = Join-Path $PSScriptRoot "whitelist.json" }
-if (-not (Test-Path $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
+if (-not (Test-Path -LiteralPath $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
 
 $displayDriver = Join-Path $PackageRoot "Display.Driver"
-if (-not (Test-Path $displayDriver)) { throw "Display.Driver not found under $PackageRoot" }
+if (-not (Test-Path -LiteralPath $displayDriver)) { throw "Display.Driver not found under $PackageRoot" }
 
-$allInfs = @(Get-ChildItem $displayDriver -Filter *.inf -File | Sort-Object Name)
+$allInfs = @(Get-ChildItem -LiteralPath $displayDriver -Filter *.inf -File | Sort-Object Name)
 if ($allInfs.Count -eq 0) { throw "No .inf files under $displayDriver - is this a Display.Driver folder?" }
 
-$nviFiles = @(Get-ChildItem $displayDriver -Filter *.nvi -File)
+$nviFiles = @(Get-ChildItem -LiteralPath $displayDriver -Filter *.nvi -File)
 if ($nviFiles.Count -ne 1) {
     throw "Expected exactly one .nvi in $displayDriver, found $($nviFiles.Count). This package's layout differs from what this script was verified against."
 }
@@ -109,7 +109,7 @@ function Add-Keep {
 # retained nvamig.inf, whose three entries are all RTX A3000m, on a machine with an A2000m. That
 # INF is 3.9 MB with 62,280 lines and 3,010 sections against nv_dispig.inf's 677 KB, and it alone
 # accounted for three quarters of the catalog build - 385 s with it, 96 s without.
-$whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
+$whitelist = Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json
 
 # --- 2. INFs that can match hardware actually present ------------------------------------------
 $targets = New-Object System.Collections.Generic.List[object]
@@ -285,7 +285,7 @@ Write-Host ("  " + (($prune | ForEach-Object { $_.Name }) -join ', '))
 $pruneNames = @($prune | ForEach-Object { $_.Name })
 foreach ($n in @($keep)) {
     $p = Join-Path $displayDriver $n
-    if (-not (Test-Path $p)) { continue }
+    if (-not (Test-Path -LiteralPath $p)) { continue }
     foreach ($l in @((Get-InfTextFile -Path $p).Lines)) {
         # Strip a trailing "; comment" first, or it would be read as part of the last filename.
         $body = ($l -split ';', 2)[0]
@@ -347,7 +347,7 @@ try {
     catch { throw "$nviPath is no longer valid XML after pruning. $_" }
 
     $manifestInfs = @($check.nvi.manifest.file | ForEach-Object { $_.getAttribute('name') } | Where-Object { $_ -like '*.inf' })
-    $onDisk = @(Get-ChildItem $displayDriver -Filter *.inf -File | ForEach-Object { $_.Name })
+    $onDisk = @(Get-ChildItem -LiteralPath $displayDriver -Filter *.inf -File | ForEach-Object { $_.Name })
     $orphanEntries = @($manifestInfs | Where-Object { $onDisk -notcontains $_ })
     $unlisted = @($onDisk | Where-Object { $manifestInfs -notcontains $_ })
 
@@ -362,7 +362,7 @@ try {
     # contains, and a companion that is listed but missing from the folder is a disagreement between
     # the manifest and the folder that this step did not cause but would otherwise inherit silently.
     $manifestFiles = @($check.nvi.manifest.file | ForEach-Object { $_.getAttribute('name') })
-    $allOnDisk = @(Get-ChildItem $displayDriver -File | ForEach-Object { $_.Name })
+    $allOnDisk = @(Get-ChildItem -LiteralPath $displayDriver -File | ForEach-Object { $_.Name })
     $stems = @($pruneNames | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) })
     $companions = @($manifestFiles | Where-Object {
         ($stems -contains [System.IO.Path]::GetFileNameWithoutExtension($_)) -and ($pruneNames -notcontains $_)

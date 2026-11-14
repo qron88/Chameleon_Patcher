@@ -54,8 +54,8 @@ $ErrorActionPreference = 'Stop'
 # NanaZip) but then failed here, after the run had already started.
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
-if (-not (Test-Path $ExePath)) { throw "Not found: $ExePath" }
-if (Test-Path $OutputPath) { throw "Output path already exists: $OutputPath - remove it or choose a different path." }
+if (-not (Test-Path -LiteralPath $ExePath)) { throw "Not found: $ExePath" }
+if (Test-Path -LiteralPath $OutputPath) { throw "Output path already exists: $OutputPath - remove it or choose a different path." }
 
 function Expand-BySevenZip {
     param([string]$Cli, [string]$Source, [string]$Dest)
@@ -79,15 +79,15 @@ catch {
     # A failed extraction leaves a PARTIAL folder behind, and the "Output path already exists"
     # guard at the top of this script would then turn the next attempt into an instant failure.
     # Remove the partial folder so a re-run starts clean, then rethrow the original error.
-    if (Test-Path $OutputPath) {
-        Remove-Item $OutputPath -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $OutputPath) {
+        Remove-Item -LiteralPath $OutputPath -Recurse -Force -ErrorAction SilentlyContinue
     }
     throw
 }
 
-$hasSetup = Test-Path (Join-Path $OutputPath "setup.exe")
-$hasCfg = Test-Path (Join-Path $OutputPath "setup.cfg")
-$hasDD = Test-Path (Join-Path $OutputPath "Display.Driver")
+$hasSetup = Test-Path -LiteralPath (Join-Path $OutputPath "setup.exe")
+$hasCfg = Test-Path -LiteralPath (Join-Path $OutputPath "setup.cfg")
+$hasDD = Test-Path -LiteralPath (Join-Path $OutputPath "Display.Driver")
 if (-not ($hasSetup -and $hasCfg -and $hasDD)) {
     throw "Extraction completed but $OutputPath doesn't look like an NVIDIA driver package (missing setup.exe/setup.cfg/Display.Driver). Wrong file, or NVIDIA changed their packaging format."
 }

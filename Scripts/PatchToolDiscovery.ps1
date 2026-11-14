@@ -102,14 +102,14 @@ function Find-SevenZip {
     param([string]$ExplicitPath)
 
     if ($ExplicitPath) {
-        if (-not (Test-Path $ExplicitPath)) { throw "7z CLI not found at the path you passed: $ExplicitPath. There is no fallback route: name a real 7z-compatible CLI with -SevenZipPath, install one (winget install -e --id 7zip.7zip), or unpack the driver by hand and run the pipeline with -SourcePackagePath." }
-        return (Resolve-Path $ExplicitPath).Path
+        if (-not (Test-Path -LiteralPath $ExplicitPath)) { throw "7z CLI not found at the path you passed: $ExplicitPath. There is no fallback route: name a real 7z-compatible CLI with -SevenZipPath, install one (winget install -e --id 7zip.7zip), or unpack the driver by hand and run the pipeline with -SourcePackagePath." }
+        return (Resolve-Path -LiteralPath $ExplicitPath).Path
     }
 
     $cacheKey = '7z'
     if ($script:PatchToolCache.ContainsKey($cacheKey)) {
         $cached = $script:PatchToolCache[$cacheKey]
-        if ($cached -and (Test-Path $cached)) { return $cached }
+        if ($cached -and (Test-Path -LiteralPath $cached)) { return $cached }
         $script:PatchToolCache.Remove($cacheKey)
     }
 
@@ -121,7 +121,7 @@ function Find-SevenZip {
         "${env:ProgramFiles(x86)}\NanaZip\7z.exe"
     )
     foreach ($c in $candidates) {
-        if (Test-Path $c) { $script:PatchToolCache[$cacheKey] = $c; return $c }
+        if (Test-Path -LiteralPath $c) { $script:PatchToolCache[$cacheKey] = $c; return $c }
     }
     $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
     if ($cmd) { $script:PatchToolCache[$cacheKey] = $cmd.Source; return $cmd.Source }
@@ -165,14 +165,14 @@ function Find-WdkTool {
     )
 
     if ($ExplicitPath) {
-        if (-not (Test-Path $ExplicitPath)) { throw "$ExeName not found at the path you passed: $ExplicitPath" }
-        return (Resolve-Path $ExplicitPath).Path
+        if (-not (Test-Path -LiteralPath $ExplicitPath)) { throw "$ExeName not found at the path you passed: $ExplicitPath" }
+        return (Resolve-Path -LiteralPath $ExplicitPath).Path
     }
 
     $cacheKey = "wdk:$ExeName"
     if ($script:PatchToolCache.ContainsKey($cacheKey)) {
         $cached = $script:PatchToolCache[$cacheKey]
-        if ($cached -and (Test-Path $cached)) { return $cached }
+        if ($cached -and (Test-Path -LiteralPath $cached)) { return $cached }
         $script:PatchToolCache.Remove($cacheKey)
     }
 
@@ -572,8 +572,8 @@ function Test-WhitelistCoversLocalGpu {
         [Parameter(Mandatory = $true)][string]$WhitelistPath
     )
 
-    if (-not (Test-Path $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
-    $whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
+    $whitelist = Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json
 
     $gpus = @(Get-LocalNvidiaGpu -AllowNonDisplayFallback)
     # Plain arrays, not List[object]: a machine has a handful of GPUs so += costs nothing, and

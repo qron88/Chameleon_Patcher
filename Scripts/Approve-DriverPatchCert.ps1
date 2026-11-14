@@ -66,7 +66,7 @@ if (-not $CerPath) {
     }
 }
 
-if (-not (Test-Path $CerPath)) { throw "Certificate not found: $CerPath" }
+if (-not (Test-Path -LiteralPath $CerPath)) { throw "Certificate not found: $CerPath" }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)

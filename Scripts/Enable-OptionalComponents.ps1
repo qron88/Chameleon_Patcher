@@ -71,13 +71,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
 if (-not $WhitelistPath) { $WhitelistPath = Join-Path $PSScriptRoot "whitelist.json" }
-if (-not (Test-Path $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
+if (-not (Test-Path -LiteralPath $WhitelistPath)) { throw "whitelist.json not found: $WhitelistPath" }
 
 $displayDriver = Join-Path $PackageRoot "Display.Driver"
 $setupCfg      = Join-Path $PackageRoot "setup.cfg"
-if (-not (Test-Path $displayDriver)) { throw "Display.Driver not found under $PackageRoot" }
+if (-not (Test-Path -LiteralPath $displayDriver)) { throw "Display.Driver not found under $PackageRoot" }
 
-$whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
+$whitelist = Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json
 
 # --- 1. INF feature flags -----------------------------------------------------------------------
 $totalAdded = 0
@@ -196,8 +196,14 @@ foreach ($key in $whitelist.PSObject.Properties.Name) {
                     $body = ($lines[$j] -split ';', 2)[0]
                     if ($body -match ('^\s*' + [regex]::Escape($f) + '\s*=\s*(\S*)')) {
                         $have = $true
-                        # Present but switched off (= 0) is the same as absent for the installer.
-                        if ($Matches[1] -ne '1') { $lines[$j] = "$f = 1"; $missing += "$f (was $($Matches[1]))" }
+                        # Present but switched off (= 0) is the same as absent for the installer. Only 0
+                        # counts as off: NVIDIA also writes other values (NVSupportGFExperienceUDA = 11 on
+                        # 38 stock sections), which are its own per-GPU decision and are left exactly as
+                        # shipped. The value is replaced in place so a trailing "; comment" survives.
+                        if ($Matches[1] -eq '0') {
+                            $lines[$j] = [regex]::Replace($lines[$j], '^(\s*' + [regex]::Escape($f) + '\s*=\s*)\S*', '${1}1')
+                            $missing += "$f (was 0)"
+                        }
                         break
                     }
                 }
@@ -238,7 +244,7 @@ Write-Host "Added $totalAdded flag line(s) across $sectionsTouched section(s)." 
 # is already disposition="default" with no userSelectable restriction, so it needs nothing here -
 # once its feature flag is set it appears pre-ticked and can be unticked like any other row.
 if (-not $SkipInstallerSelectable) {
-    if (-not (Test-Path $setupCfg)) {
+    if (-not (Test-Path -LiteralPath $setupCfg)) {
         Write-Warning "setup.cfg not found under $PackageRoot - skipping the NVIDIA App selectability change."
     }
     else {

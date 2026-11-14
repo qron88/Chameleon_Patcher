@@ -75,10 +75,10 @@ $ErrorActionPreference = 'Stop'
 if (-not $WhitelistPath) {
     $WhitelistPath = Join-Path $PSScriptRoot "whitelist.json"
 }
-if (-not (Test-Path $DisplayDriverPath)) { throw "Display.Driver path not found: $DisplayDriverPath" }
-if (-not (Test-Path $WhitelistPath))     { throw "whitelist.json not found: $WhitelistPath" }
+if (-not (Test-Path -LiteralPath $DisplayDriverPath)) { throw "Display.Driver path not found: $DisplayDriverPath" }
+if (-not (Test-Path -LiteralPath $WhitelistPath))     { throw "whitelist.json not found: $WhitelistPath" }
 
-$whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
+$whitelist = Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json
 
 $errors   = New-Object System.Collections.Generic.List[string]
 $warnings = New-Object System.Collections.Generic.List[string]
@@ -91,8 +91,8 @@ $warnings = New-Object System.Collections.Generic.List[string]
 # to block signing.
 $packageRoot = Split-Path $DisplayDriverPath -Parent
 $packageInfNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-if ($packageRoot -and (Test-Path $packageRoot)) {
-    Get-ChildItem -Path $packageRoot -Filter *.inf -Recurse -ErrorAction SilentlyContinue |
+if ($packageRoot -and (Test-Path -LiteralPath $packageRoot)) {
+    Get-ChildItem -LiteralPath $packageRoot -Filter *.inf -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object { [void]$packageInfNames.Add($_.Name) }
 }
 
@@ -292,7 +292,7 @@ foreach ($t in $targets) {
             if (-not $sections.ContainsKey($r)) { $unresolved.Add("[$k] references missing section [$r]") }
         }
         foreach ($inc in $refs.Includes) {
-            if (-not (Test-Path (Join-Path $DisplayDriverPath $inc)) -and -not $packageInfNames.Contains($inc)) {
+            if (-not (Test-Path -LiteralPath (Join-Path $DisplayDriverPath $inc)) -and -not $packageInfNames.Contains($inc)) {
                 [void]$unresolvedIncludes.Add($inc)
             }
         }
@@ -337,7 +337,7 @@ if (-not $SkipRmOverrideCheck) {
     $rmSectionsMissing = New-Object System.Collections.Generic.List[string]
     $infsWithRmSections = 0
 
-    Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
+    Get-ChildItem -LiteralPath $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
         $sections = Get-InfSections -Lines @((Get-InfTextFile -Path $_.FullName).Lines)
         $found = 0
         foreach ($k in $sections.Keys) {

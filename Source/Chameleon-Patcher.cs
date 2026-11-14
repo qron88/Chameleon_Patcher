@@ -21,8 +21,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.6.0")]
-[assembly: AssemblyInformationalVersion("1.0.6")]
+[assembly: AssemblyFileVersion("1.0.7.0")]
+[assembly: AssemblyInformationalVersion("1.0.7")]
 
 namespace ChameleonPatcherGui
 {
@@ -523,11 +523,13 @@ namespace ChameleonPatcherGui
         /// stdout, or null if the question could not be answered. Touches nothing on disk, so this
         /// is safe to call before a run.
         /// </summary>
-        private string CheckPatchToolsQuery()
+        private string CheckPatchToolsQuery(string driverPath, bool isExe)
         {
             // The SDK search walks Windows Kits recursively; on a cold disk that alone can take longer
-            // than the default bound, and a timed-out query silently skipped this check.
-            return QueryPipeline("-CheckPatchTools", null, false, false, 120000);
+            // than the default bound, and a timed-out query silently skipped this check. The source is
+            // passed along because only an .exe needs the 7z CLI: for an unpacked folder the pipeline
+            // answers "7z: NOT NEEDED" instead of refusing a run that would work without it.
+            return QueryPipeline("-CheckPatchTools", isExe ? null : driverPath, isExe, false, 120000);
         }
 
         /// <summary>
@@ -1418,13 +1420,14 @@ namespace ChameleonPatcherGui
             // Ask the pipeline which tools this machine can resolve, before anything is unpacked.
             // All three are hard requirements, each for its own reason: Inf2Cat is the only thing
             // that rebuilds nv_disp.cat after the INFs are edited, signtool signs what it rebuilds,
-            // and a 7z-compatible CLI is what unpacks the driver download this run starts from.
+            // and a 7z-compatible CLI is what unpacks the driver download this run starts from (an
+            // already-unpacked folder never calls it, and is reported as such by the pipeline).
             // NVIDIA's own launcher is not a fallback any more - it self-elevates, asks for the
             // folder to extract into, and unpacks into a system-temp folder a non-elevated run may
             // not be allowed to list - so a missing 7-Zip is as dead a run as a missing SDK, and
             // the catalog rebuild is the step that takes tens of minutes, so finding either out
             // afterwards is expensive. The pipeline owns the rules; this only asks and reports.
-            string toolReport = await Task.Run(() => CheckPatchToolsQuery());
+            string toolReport = await Task.Run(() => CheckPatchToolsQuery(driverPath, isExe));
             if (toolReport != null && toolReport.StartsWith("TOOLS_MISSING"))
             {
                 // Split the report into what was missing, what was found, and the guidance the
@@ -1449,6 +1452,7 @@ namespace ChameleonPatcherGui
                         int colon = trimmed.IndexOf(':');
                         string tool = trimmed.Substring(0, colon).Trim();
                         string value = trimmed.Substring(colon + 1).Trim();
+                        if (value == "NOT NEEDED") continue;
                         if (value.Length == 0 || value == "NOT FOUND") missingNames = AppendName(missingNames, HumanToolName(tool));
                         else foundNames = AppendName(foundNames, ShortToolName(tool));
                         continue;
@@ -1527,7 +1531,7 @@ namespace ChameleonPatcherGui
                     string trimmed = line.Trim();
                     if (trimmed.StartsWith("7z:")) { sevenZipLine = trimmed.Substring(3).Trim(); break; }
                 }
-                if (sevenZipLine.Length > 0 && sevenZipLine != "NOT FOUND")
+                if (sevenZipLine.Length > 0 && sevenZipLine != "NOT FOUND" && sevenZipLine != "NOT NEEDED")
                 {
                     lblStatus.Text = "Unpacking with: " + sevenZipLine;
                 }

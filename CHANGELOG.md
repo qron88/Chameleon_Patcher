@@ -10,6 +10,35 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-11-14
+
+### Fixed
+
+- **A driver path containing `[` or `]` is no longer read as a wildcard.** Path parameters went through
+  `Resolve-Path`, `Test-Path` and `Get-ChildItem` without `-LiteralPath`, so a download renamed by the
+  browser to `...[1].exe` (or a package folder with such a name) resolved to nothing and the run died
+  with `Cannot bind argument to parameter 'Path' because it is an empty string`. Every path coming from
+  a parameter in `Scripts\*.ps1` now uses `-LiteralPath` (the `Cert:` provider calls are untouched).
+  Checked: `Resolve-Path` on a `x[1]` folder returned nothing before and the folder itself with
+  `-LiteralPath`; a new test patches and gates a package whose folder is called `br[1]-...`.
+- **The GUI no longer demands 7-Zip for a source that is already an unpacked folder.**
+  `-CheckPatchTools` treated a missing 7z CLI as fatal whatever the source, and the GUI refused to start;
+  the run itself never calls 7z for `-SourcePackagePath`. The GUI now passes the folder to the query and
+  the pipeline answers `7z:       NOT NEEDED`; an `.exe` source behaves as before. The exe was rebuilt.
+- **NVIDIA's own feature-flag values are no longer overwritten.** `Enable-OptionalComponents.ps1` took
+  anything but `1` for "switched off", so `NVSupportGFExperienceUDA = 11` (38 stock sections in 621.24)
+  would have been rewritten to `= 1` on any such section a whitelisted GPU used, dropping its comment.
+  Only `= 0` is switched on now, in place. No effect on any package built so far (those 38 sections were
+  never reached); covered by a new test.
+- **`Add-SetupCertOption.ps1` finds an existing `<dependencies>` block anywhere inside Display.Driver.**
+  It recognised one only as the first child; a block further down got a second, sibling
+  `<dependencies>` next to it. The real 621.24 `setup.cfg` has it first, so no built package was
+  affected. Covered by a new test.
+
+Not changed on purpose: `Unpack-DriverExe.ps1` already removes the partial folder when 7z fails (the
+leftover case is only "7z succeeded but the result is not a driver package"), and the password
+environment variable is already removed by the pipeline before anything else runs.
+
 ## [1.0.6] - 2026-11-13
 
 ### Security

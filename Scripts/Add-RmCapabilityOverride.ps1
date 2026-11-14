@@ -53,7 +53,7 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot "PatchToolDiscovery.ps1")
 
-if (-not (Test-Path $DisplayDriverPath)) { throw "Path not found: $DisplayDriverPath" }
+if (-not (Test-Path -LiteralPath $DisplayDriverPath)) { throw "Path not found: $DisplayDriverPath" }
 
 $RmKeyLine = "HKR,,RM1457588,%REG_DWORD%,1"
 $totalPatched = 0
@@ -61,7 +61,7 @@ $totalFiles = 0
 $infsWithMiscSections = 0
 $infsSeen = 0
 
-Get-ChildItem -Path $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
+Get-ChildItem -LiteralPath $DisplayDriverPath -Filter "*.inf" | ForEach-Object {
     $path = $_.FullName
     # Read through the toolkit's shared reader, which reports the encoding the file really is and the
     # line endings it really uses, and hand that report back to the writer below. Get-Content -Encoding

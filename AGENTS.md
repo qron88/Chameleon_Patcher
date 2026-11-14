@@ -30,8 +30,10 @@ but is not (no unlock, wrong files). Most mechanisms below serve one of these.
 
 ## How to check a claim before you make it
 
-- `.\Tests\Run.ps1` - 76 Pester tests, ~5 s, Pester 3.4 (built into Windows PowerShell 5.1). They
-  build tiny packages, certificates and catalogs in `%TEMP%`; nothing touches a store.
+- `.\Tests\Run.ps1` - 81 Pester tests, ~5 s, Pester 3.4 (built into Windows PowerShell 5.1). They
+  build tiny packages, certificates and catalogs in `%TEMP%`; nothing touches a store. Run it with
+  `powershell.exe -File .\Tests\Run.ps1`: from a PowerShell 7 host one test (`Get-SystemToolPath`
+  "throws for a tool that is not in System32") fails for a host reason, not a code one.
 - A real run: `.\Scripts\Invoke-DriverPatchPipeline.ps1 -SourceExePath Drivers\<x>.exe
   -PruneForeignOemInfs -NonInteractive` takes ~2.5 min on a machine with a whitelisted GPU (the
   universal build takes ~1 h). `Drivers\` is git-ignored and holds downloads; some are deliberately
@@ -155,6 +157,38 @@ be an improvement; until then, change both sides together.
 - Long comments explain past failures. Do not strip them as noise; move history to the changelog
   if a comment no longer explains current code.
 
+## Claims that were checked and are not defects
+
+Raised by an external review of 1.0.6 and refuted by reading the code or measuring. (The real findings
+of that review - `-LiteralPath`, 7z for a folder source, flag values other than 0/1, a `<dependencies>`
+block that is not the first child - are fixed in 1.0.7; see the changelog.)
+
+- **"A failed 7z extraction leaves a partial output folder that blocks the next run."**
+  `Unpack-DriverExe.ps1` removes the partial folder in its `catch` and rethrows. Only the case where
+  7z succeeds but the result is not an NVIDIA package (no `setup.exe` / `setup.cfg` / `Display.Driver`)
+  leaves the folder behind, and then the "Output path already exists" guard is the intended stop.
+- **"`DRIVER_PATCH_PFX_PASSWORD` survives in the environment of the child processes."** The pipeline
+  reads it and removes it from its own environment immediately, before Inf2Cat, signtool or 7z start.
+  The measurement behind the claim passed `-PfxPassword` as well, so the variable was never read and
+  never removed - not the path the GUI uses.
+- **"The Test Signing warning in `Approve-DriverPatchCert.ps1` is a false alarm because `bcdedit /enum
+  '{current}'` fails."** It fails when the shell is not elevated (plain `bcdedit /enum` answers
+  access denied). The script is meant to run elevated, so a non-elevated measurement proves nothing.
+  What an elevated, non-English Windows prints for the value was not measured either way.
+- **"The gate prints `PASSED - 0/0` and exits 0."** Only with a hand-supplied empty `-WhitelistPath`
+  (`'{}'`). The shipped `whitelist.json` has 61 entries, and a whitelist INF that resolves to no file
+  is an error, not a skipped entry. Nobody gets 0/0 without asking for it.
+- **Findings that cite files or functions the repository does not have** (`Source\Helpers\*.ps1`,
+  `Source\GUI\*.ps1`, `Import-EncodedFile`, `Set-InfProperty`, `Merge-InfSections`, ...). `Source\`
+  holds `Build.ps1` and `Chameleon-Patcher.cs` only; the GUI is C#, the helpers are in
+  `Scripts\PatchToolDiscovery.ps1`. Open the cited line before believing a finding; a claim that names
+  something missing from the tree is invented.
+
+Smaller claims of the same review that were already answered: the continuation counter *is* reported
+(`Test-InfLineContinuations`), the merge check in the gate is not a tautology (it asserts the merged
+job reached the file), and the encoding layer does not lose a BOM (UTF-16LE+BOM, UTF-8+BOM and LF-only
+files round-trip byte for byte).
+
 ## Known open items (real, documented, not yet done)
 
 - Narrowing `RM1457588` to reachable sections - needs a hardware install test.
@@ -169,4 +203,7 @@ be an improvement; until then, change both sides together.
 2. Anything that touches INF logic: one pruned real run on a driver in `Drivers\` (and a universal
    run on a renamed release such as 616.92 if the rename or gate logic changed).
 3. Keep scripts ASCII and CRLF; keep the GUI phrase contract; only add to subject patterns.
+   Paths that arrive through a parameter go through `-LiteralPath` (`Test-Path`, `Get-ChildItem`,
+   `Resolve-Path`, `Copy-Item`, `Get-Content`): a download renamed to `...[1].exe` is a wildcard
+   otherwise.
 4. Add a `CHANGELOG.md` entry that says what failed before and how the change was verified.

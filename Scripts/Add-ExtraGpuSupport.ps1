@@ -62,14 +62,14 @@ if (-not $WhitelistPath) {
     $WhitelistPath = Join-Path $PSScriptRoot "whitelist.json"
 }
 
-if (-not (Test-Path $DisplayDriverPath)) {
+if (-not (Test-Path -LiteralPath $DisplayDriverPath)) {
     throw "Display.Driver path not found: $DisplayDriverPath"
 }
-if (-not (Test-Path $WhitelistPath)) {
+if (-not (Test-Path -LiteralPath $WhitelistPath)) {
     throw "whitelist.json not found: $WhitelistPath"
 }
 
-$whitelist = Get-Content $WhitelistPath -Raw | ConvertFrom-Json
+$whitelist = Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json
 
 function Find-DeviceBlocks {
     param([string[]]$Lines)
