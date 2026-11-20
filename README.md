@@ -993,18 +993,18 @@ continuations). It also owns the byte-preserving reader/writer pair described un
 ## Version
 
 The version is declared once, as assembly attributes at the top of `Source\Chameleon-Patcher.cs`
-(currently **1.1.0**):
+(currently **1.1.1**):
 
 ```csharp
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
-[assembly: AssemblyInformationalVersion("1.1.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyInformationalVersion("1.1.1")]
 ```
 
 Everything else reads that one declaration back, so it appears in four places: the **file name** of
-the built executables (`Chameleon-Patcher-1.1.0.exe`, `Chameleon-Patcher-Overlay-1.1.0.exe`), the
-**window title bar** (`Chameleon Patcher 1.1.0`), the file's **Win32 version resource** (`csc.exe` folds it in, no
-`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher-1.1.0.exe).VersionInfo` show
+the built executables (`Chameleon-Patcher-1.1.1.exe`, `Chameleon-Patcher-Overlay-1.1.1.exe`), the
+**window title bar** (`Chameleon Patcher 1.1.1`), the file's **Win32 version resource** (`csc.exe` folds it in, no
+`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher-1.1.1.exe).VersionInfo` show
 it), and **every patch log header**, stamped at runtime. Bumping a release means editing those
 attributes and rebuilding with `.\Source\Build.ps1`; keep `AssemblyVersion` at `x.y.0.0` and let the
 file and informational versions carry the precise one.

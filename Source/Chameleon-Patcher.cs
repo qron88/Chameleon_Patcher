@@ -20,9 +20,9 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Chameleon Patcher")]
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
-[assembly: AssemblyInformationalVersion("1.1.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyInformationalVersion("1.1.1")]
 
 namespace ChameleonPatcherGui
 {
@@ -222,7 +222,19 @@ namespace ChameleonPatcherGui
                             }
                         }
                         Directory.CreateDirectory(Path.GetDirectoryName(dest));
-                        File.WriteAllBytes(dest, data);
+                        // Atomic: write beside the target, then move into place, so a crash or a
+                        // full disk never leaves a half-written script behind.
+                        string tmp = dest + ".tmp-" + Process.GetCurrentProcess().Id;
+                        try
+                        {
+                            File.WriteAllBytes(tmp, data);
+                            if (File.Exists(dest)) File.Delete(dest);
+                            File.Move(tmp, dest);
+                        }
+                        finally
+                        {
+                            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                        }
                     }
                 }
                 finally

@@ -10,6 +10,24 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-20
+
+Merge of the 1.1.0 standalone build with the useful parts of an independent implementation of the
+same feature (`Chameleon_Patcher_Qwen`, 1.1.0q).
+
+### Added
+- `Tests\Build.Tests.ps1` (9 tests): output naming of both variants, version read from the
+  assembly attributes, `-OutputPath` refused with `-Variant All`, every real `Scripts\` file embedded
+  byte for byte, the overlay embedding nothing, refusal when `Scripts\` is missing. Compiles
+  throwaway exes into `%TEMP%` with the real `csc.exe`.
+
+### Changed
+- The standalone exe now writes each extracted script atomically (temp file beside the target,
+  then move), so a crash or full disk cannot leave a half-written script. Before, `File.WriteAllBytes`
+  wrote in place; the next start repaired it, but only if it got that far. Extraction still compares
+  bytes on every start and repairs modified files, under the named mutex.
+- Version 1.1.1.
+
 ## [1.1.0] - 2026-11-20
 
 Milestone: the toolkit can now be distributed as one file.

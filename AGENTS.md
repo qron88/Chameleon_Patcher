@@ -30,7 +30,7 @@ but is not (no unlock, wrong files). Most mechanisms below serve one of these.
 
 ## How to check a claim before you make it
 
-- `.\Tests\Run.ps1` - 81 Pester tests, ~5 s, Pester 3.4 (built into Windows PowerShell 5.1). They
+- `.\Tests\Run.ps1` - 90 Pester tests, ~5 s, Pester 3.4 (built into Windows PowerShell 5.1). They
   build tiny packages, certificates and catalogs in `%TEMP%`; nothing touches a store. Run it with
   `powershell.exe -File .\Tests\Run.ps1`: from a PowerShell 7 host one test (`Get-SystemToolPath`
   "throws for a tool that is not in System32") fails for a host reason, not a code one.
