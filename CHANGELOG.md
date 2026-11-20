@@ -10,6 +10,28 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-20
+
+Milestone: the toolkit can now be distributed as one file.
+
+### Added
+- `Build.ps1 -Variant Standalone|Overlay|All` (default Standalone; the overlay build is made only
+  with `-Variant Overlay` or `All`). Standalone produces
+  `Chameleon-Patcher-<version>.exe`: compiled with `/define:STANDALONE`, it embeds everything under
+  `Scripts\` and unpacks it to `%LOCALAPPDATA%\ChameleonPatcher\Scripts` on every start (missing or
+  modified files are rewritten byte for byte). Signing keys live in
+  `%LOCALAPPDATA%\ChameleonPatcher\Certificates`, next to that `Scripts` folder, where the scripts
+  already look relative to themselves. The overlay `Chameleon-Patcher.exe` behaves as before
+  (`Scripts\` and `Certificates\` beside the exe). Verified: overlay has 0 embedded resources,
+  standalone 15; extracted files hash-identical to the repo; both start; `-CheckPatchTools` runs
+  from the extracted copy. `Tests\Run.ps1` not re-run (scripts unchanged).
+
+### Changed
+- Built executables carry the version in their file name (`Chameleon-Patcher-1.1.0.exe` for
+  the standalone build, `Chameleon-Patcher-Overlay-1.1.0.exe` for the overlay), read by `Build.ps1` from
+  `AssemblyInformationalVersion`, so file name, Win32 version resource and log header cannot drift.
+  The committed unversioned `Chameleon-Patcher.exe` is no longer rebuilt by the script.
+
 ## [1.0.7] - 2026-11-14
 
 ### Fixed

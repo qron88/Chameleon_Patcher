@@ -20,9 +20,9 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Chameleon Patcher")]
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.7.0")]
-[assembly: AssemblyInformationalVersion("1.0.7")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
 
 namespace ChameleonPatcherGui
 {
@@ -147,11 +147,92 @@ namespace ChameleonPatcherGui
 
         public MainForm()
         {
-            // This exe lives at the project root; the pipeline scripts live in .\Scripts.
+            // The pipeline scripts are embedded in this exe (see Build.ps1) and unpacked to
+            // DataDir\Scripts. The scripts keep Certificates in the folder next to Scripts, so
+            // DataDir\Certificates is where signing keys live - it persists across versions.
+#if STANDALONE
+            scriptsDir = Path.Combine(DataDir, "Scripts");
+            try { ExtractEmbeddedScripts(scriptsDir); }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not unpack the embedded scripts to " + scriptsDir + ":\n" + ex.Message,
+                    "Chameleon Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+#else
+            // Overlay build: this exe lives at the project root; the pipeline scripts live in .\Scripts.
             scriptsDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Scripts");
+#endif
             Live = this;
             BuildUi();
         }
+
+        // Per-user, writable, survives upgrades of the exe. Scripts\ below it is rewritten from the
+        // embedded copy; Certificates\ is created by the scripts and never touched here.
+#if STANDALONE
+        internal static readonly string DataDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChameleonPatcher");
+#else
+        // Overlay build: Scripts\ and Certificates\ sit next to the exe.
+        internal static readonly string DataDir = AppDomain.CurrentDomain.BaseDirectory;
+#endif
+
+#if STANDALONE
+        /// <summary>
+        /// Writes every embedded "Scripts/..." resource under <paramref name="target"/>, byte for
+        /// byte. Runs on every start and rewrites only files that are missing or differ, so edited
+        /// or damaged copies are repaired and an unchanged install costs a few file reads. A named
+        /// mutex keeps two instances from writing the same files at once.
+        /// </summary>
+        private static void ExtractEmbeddedScripts(string target)
+        {
+            const string prefix = "Scripts/";
+            Assembly asm = Assembly.GetExecutingAssembly();
+            bool owned = false;
+            using (var mutex = new Mutex(false, @"Local\ChameleonPatcherScriptExtract"))
+            {
+                try
+                {
+                    try { owned = mutex.WaitOne(TimeSpan.FromSeconds(30)); }
+                    catch (AbandonedMutexException) { owned = true; }
+
+                    foreach (string name in asm.GetManifestResourceNames())
+                    {
+                        if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                        string rel = name.Substring(prefix.Length).Replace('/', Path.DirectorySeparatorChar);
+                        string dest = Path.Combine(target, rel);
+
+                        byte[] data;
+                        using (Stream s = asm.GetManifestResourceStream(name))
+                        using (var ms = new MemoryStream())
+                        {
+                            s.CopyTo(ms);
+                            data = ms.ToArray();
+                        }
+
+                        if (File.Exists(dest))
+                        {
+                            byte[] current = null;
+                            try { current = File.ReadAllBytes(dest); } catch { }
+                            if (current != null && current.Length == data.Length)
+                            {
+                                bool same = true;
+                                for (int i = 0; i < data.Length; i++)
+                                    if (current[i] != data[i]) { same = false; break; }
+                                if (same) continue;
+                            }
+                        }
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest));
+                        File.WriteAllBytes(dest, data);
+                    }
+                }
+                finally
+                {
+                    if (owned) mutex.ReleaseMutex();
+                }
+            }
+        }
+
+#endif
 
         private void BuildUi()
         {
@@ -1654,7 +1735,7 @@ namespace ChameleonPatcherGui
                         // other's private key, which means the old fixed name is only one candidate
                         // among several now. Offer the newest file matching the pattern; the old
                         // name still matches it.
-                        string certDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Certificates");
+                        string certDir = Path.Combine(DataDir, "Certificates");
                         string defaultPfx = null;
                         if (Directory.Exists(certDir))
                         {

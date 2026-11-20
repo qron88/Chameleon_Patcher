@@ -1,3 +1,8 @@
+# Built executables (Source\Build.ps1 writes them to the project root). The repository carries
+# source only; the .exe files are distributed as release assets.
+/Chameleon-Patcher.exe
+/Chameleon-Patcher-*.exe
+
 # Generated at runtime
 Logs/
 Certificates/

@@ -152,8 +152,11 @@ be an improvement; until then, change both sides together.
 - The pipeline never overwrites an output folder and has no resume: a partial package must never be
   mistaken for a finished one.
 - RFC 3161 timestamping over `http://` is normal (the response is signed); it is best-effort.
-- `Chameleon-Patcher.exe` is committed because users double-click it; it is rebuilt from
-  `Source\` with the Framework's `csc.exe` and committed with the scripts it runs.
+- The GUI is built from `Source\` with the Framework's `csc.exe` by `Source\Build.ps1`; file names
+  carry the version. Default output is `Chameleon-Patcher-<version>.exe` (all of `Scripts\`
+  embedded, unpacked to `%LOCALAPPDATA%\ChameleonPatcher` at start); `-Variant Overlay` builds
+  `Chameleon-Patcher-Overlay-<version>.exe`, which runs the `Scripts\` beside it. After any change under
+  `Scripts\`, rebuild the standalone - it holds a frozen copy.
 - Long comments explain past failures. Do not strip them as noise; move history to the changelog
   if a comment no longer explains current code.
 

@@ -62,11 +62,17 @@ reworking a mechanism, read [AGENTS.md](AGENTS.md), which says why each one is t
 
 ## Quick start
 
-Double-click `Chameleon-Patcher.exe`, pick the downloaded driver `.exe` (or an already-unpacked
+Build the app once with `.\Source\Build.ps1`, which writes `Chameleon-Patcher-<version>.exe`
+to the project root. Double-click it, pick the downloaded driver `.exe` (or an already-unpacked
 package folder), press **Start Patching**. The app verifies the source, unpacks, patches, checks,
 signs and adds the installer checkbox, shows progress per step, and offers to launch `setup.exe` when
-it finishes. It must stay in the project root - it finds `Scripts\Invoke-DriverPatchPipeline.ps1`
-next to itself.
+it finishes. The standalone build carries every script inside it, so it can be copied anywhere on its
+own; it unpacks them to `%LOCALAPPDATA%\ChameleonPatcher\Scripts` and keeps signing keys in
+`%LOCALAPPDATA%\ChameleonPatcher\Certificates`.
+
+The optional **overlay** build (`.\Source\Build.ps1 -Variant Overlay` -> `Chameleon-Patcher-Overlay-<version>.exe`)
+is the small GUI only: it must stay in the project root and finds `Scripts\Invoke-DriverPatchPipeline.ps1`
+next to itself, with `Certificates\` there too.
 
 Four checkboxes, and what each maps to in the pipeline:
 
@@ -850,8 +856,8 @@ exactly as stock.
 
 ## The GUI
 
-`Chameleon-Patcher.exe` is a small WinForms app that runs `Scripts\Invoke-DriverPatchPipeline.ps1` as
-a child `powershell.exe` (started from `System32\WindowsPowerShell\v1.0`, not by bare name) and parses
+`Chameleon-Patcher-<version>.exe` (or the overlay `Chameleon-Patcher-Overlay-<version>.exe`) is a
+small WinForms app that runs `Scripts\Invoke-DriverPatchPipeline.ps1` as a child `powershell.exe` (started from `System32\WindowsPowerShell\v1.0`, not by bare name) and parses
 its `=== N/M: ... ===` banners for progress. A field for the driver `.exe`/folder, a **Start Patching**
 button, a progress bar with the current step name, a "Show details" toggle that expands to a live
 console log, and an **Open log folder** button. On success it asks whether to launch `setup.exe`; on
@@ -933,7 +939,8 @@ run by hand.
 
 ```
 Chameleon_Patcher\
-|- Chameleon-Patcher.exe    <- main app, double-click to run; must stay at the root
+|- Chameleon-Patcher-<version>.exe          <- built by Source\Build.ps1; scripts embedded, runs anywhere
+|- Chameleon-Patcher-Overlay-<version>.exe  <- optional overlay build (-Variant Overlay); must stay at the root
 |- README.md, CHANGELOG.md, AGENTS.md, LICENSE
 |- Source\                  <- source for the one component that ships as a binary
 |  |- Chameleon-Patcher.cs     <- the GUI; version attributes live at the top
@@ -986,31 +993,36 @@ continuations). It also owns the byte-preserving reader/writer pair described un
 ## Version
 
 The version is declared once, as assembly attributes at the top of `Source\Chameleon-Patcher.cs`
-(currently **1.0.7**):
+(currently **1.1.0**):
 
 ```csharp
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.7.0")]
-[assembly: AssemblyInformationalVersion("1.0.7")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyInformationalVersion("1.1.0")]
 ```
 
-Everything else reads that one declaration back, so it appears in three places: the **window title
-bar** (`Chameleon Patcher 1.0.7`), the file's **Win32 version resource** (`csc.exe` folds it in, no
-`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher.exe).VersionInfo` show
+Everything else reads that one declaration back, so it appears in four places: the **file name** of
+the built executables (`Chameleon-Patcher-1.1.0.exe`, `Chameleon-Patcher-Overlay-1.1.0.exe`), the
+**window title bar** (`Chameleon Patcher 1.1.0`), the file's **Win32 version resource** (`csc.exe` folds it in, no
+`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher-1.1.0.exe).VersionInfo` show
 it), and **every patch log header**, stamped at runtime. Bumping a release means editing those
 attributes and rebuilding with `.\Source\Build.ps1`; keep `AssemblyVersion` at `x.y.0.0` and let the
 file and informational versions carry the precise one.
 
 One limit, because it is the way the number *can* mislead: the version lives in the compiled GUI,
-while everything the GUI runs is plain PowerShell read from `Scripts\` at start time. A run is
-therefore identified by the version **plus** the revision of `Scripts\` beside the `.exe`; an `.exe`
-in a working tree whose scripts have moved on stamps an older number over newer behaviour. Cutting a
+while everything the GUI runs is plain PowerShell. The standalone build freezes the scripts it was
+built from, so its number is exact for them. The overlay build reads `Scripts\` beside the `.exe`, so a
+run is identified by the version **plus** that revision; an overlay `.exe` in a working tree whose
+scripts have moved on stamps an older number over newer behaviour. Cutting a
 release means a dated `CHANGELOG.md` heading, the bumped attributes, a green `.\Tests\Run.ps1`, a
-rebuild, and the rebuilt `.exe` committed in the same commit as the scripts it runs against.
+rebuild, and the rebuilt `.exe` files attached to the release as assets. They are not committed
+(`.gitignore` excludes them); the repository carries source only.
 
-`Source\Build.ps1` is a wrapper around one `csc.exe` call and writes the `.exe` to the **project
-root**, not beside itself - that placement is load-bearing, because the app resolves
-`Scripts\Invoke-DriverPatchPipeline.ps1` relative to its own folder. It prints the version resource it
+`Source\Build.ps1` is a wrapper around `csc.exe`. By default it builds only the standalone `.exe`
+(`/define:STANDALONE`, every file under `Scripts\` embedded as a resource); `-Variant Overlay` builds
+the overlay and `-Variant All` both. Output goes to the **project root**, not beside the script - for
+the overlay that placement is load-bearing, because it resolves
+`Scripts\Invoke-DriverPatchPipeline.ps1` relative to its own folder. File names carry the version. It prints the version resource it
 produced, so a source/Explorer mismatch surfaces at build time. `/win32icon` embeds
 `Assets\Chameleon.ico`, and the app reads that icon back out of its own `.exe` for the window and
 taskbar, so no `.ico` needs to sit next to the binary.
