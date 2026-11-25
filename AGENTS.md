@@ -137,8 +137,9 @@ catalogs are signed; after signing, every INF must be a member of its declared c
 pruned OEM INFs stay on disk with NVIDIA's (now invalid) signature; nothing declares them.
 
 ### The GUI asks the pipeline instead of reimplementing rules
-`-ShowOutputPath`, `-CheckLocalGpuSupport`, `-CheckPatchTools`, `-CheckSource` keep each rule in one
-place. The price is a text protocol: the first stdout line is a verdict word, and the GUI recognises
+`-ShowOutputPath`, `-CheckLocalGpuSupport`, `-CheckPatchTools`, `-CheckSource`, `-CheckNvAppStaged`
+keep each rule in one place. The price is a text protocol: the first stdout line is a verdict word,
+and the GUI recognises
 the `.pfx` failure by the phrase `none was supplied and prompting is disabled`. Keep that phrase in
 `Invoke-DriverPatchPipeline.ps1` and `Sign-DriverPackage.ps1`. The pipeline forces UTF-8 stdout
 because a windowless child otherwise writes in the OEM codepage. A structured (JSON) protocol would

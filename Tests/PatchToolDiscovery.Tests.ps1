@@ -30,6 +30,31 @@ function Remove-ScratchDir {
     if ($Path -and (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# Stands in for a package folder NVIDIA App stages under its post-processing directory:
+# setup.exe + setup.cfg + Display.Driver (the Test-DriverPackageRoot trio), with setup.exe's
+# timestamp set so tests can pin which staged folder is "the newest".
+function New-FakeStagedPackage {
+    param(
+        [string]$Root,
+        [string]$Leaf,
+        [datetime]$Modified,
+        [string]$Version = '621.40'
+    )
+    $dir = Join-Path $Root $Leaf
+    New-Item -ItemType Directory -Path (Join-Path $dir 'Display.Driver') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'setup.exe') -Value 'stub'
+    if ($Version) {
+        Set-Content -LiteralPath (Join-Path $dir 'setup.cfg') -Value @(
+            '<?xml version="1.0" encoding="utf-8"?>',
+            ('<setup title="${{ProductTitle}}" version="' + $Version + '" installerMin="2.1002.158.1139">'),
+            '</setup>')
+    } else {
+        Set-Content -LiteralPath (Join-Path $dir 'setup.cfg') -Value '<setup title="x">'
+    }
+    (Get-Item -LiteralPath (Join-Path $dir 'setup.exe')).LastWriteTimeUtc = $Modified
+    return $dir
+}
+
 Describe 'Get-InfSectionIndex' {
     # EndIndex from the section scanners is an UPPER BOUND (end of file for the last section), so the
     # insert point has to be walked back over the blank/comment tail of the body.
@@ -471,5 +496,63 @@ Describe 'Get-SystemToolPath' {
     }
     It 'throws for a tool that is not in System32' {
         { Get-SystemToolPath 'definitely-not-a-tool.exe' } | Should Throw
+    }
+}
+
+Describe 'Find-NvAppStagedPackage' {
+    It 'returns null when the staging folder does not exist' {
+        $root = New-ScratchDir 'nvapp'
+        try {
+            Find-NvAppStagedPackage -RootPath (Join-Path $root 'no-such-dir') | Should Be $null
+        } finally { Remove-ScratchDir $root }
+    }
+
+    It 'returns null when no staged folder is a package root' {
+        $root = New-ScratchDir 'nvapp'
+        try {
+            # NVIDIA App also leaves partial and non-driver artifacts in this directory: a hash
+            # folder that is not a driver package root must not produce an offer.
+            New-Item -ItemType Directory -Path (Join-Path $root 'abc123') | Out-Null
+            $partial = Join-Path $root 'def456'
+            New-Item -ItemType Directory -Path $partial | Out-Null
+            Set-Content -LiteralPath (Join-Path $partial 'setup.exe') -Value 'stub'
+            Find-NvAppStagedPackage -RootPath $root | Should Be $null
+        } finally { Remove-ScratchDir $root }
+    }
+
+    It 'picks the newest staged package and reports its version' {
+        $root = New-ScratchDir 'nvapp'
+        try {
+            $old = New-FakeStagedPackage -Root $root -Leaf 'aaa111' -Modified ([datetime]'2026-11-01') -Version '610.88'
+            $new = New-FakeStagedPackage -Root $root -Leaf 'bbb222' -Modified ([datetime]'2026-11-20') -Version '621.40'
+            $hit = Find-NvAppStagedPackage -RootPath $root
+            $hit.Path | Should Be $new
+            $hit.Version | Should Be '621.40'
+            $hit.Modified | Should Be ([datetime]'2026-11-20')
+        } finally { Remove-ScratchDir $root }
+    }
+
+    It 'skips previous patch outputs that sit beside the staged folders' {
+        # <hash>_Patched also passes Test-DriverPackageRoot (re-signed setup.exe, setup.cfg and
+        # Display.Driver are all there). Offering it as a source would be a trap: Test-DriverSource
+        # refuses a patched folder, and the user would get that refusal instead of the offer.
+        $root = New-ScratchDir 'nvapp'
+        try {
+            $real = New-FakeStagedPackage -Root $root -Leaf 'aaa111' -Modified ([datetime]'2026-11-01')
+            New-FakeStagedPackage -Root $root -Leaf 'aaa111_Patched' -Modified ([datetime]'2026-11-25') | Out-Null
+            $hit = Find-NvAppStagedPackage -RootPath $root
+            $hit.Path | Should Be $real
+        } finally { Remove-ScratchDir $root }
+    }
+
+    It 'still offers a package whose setup.cfg carries no version attribute' {
+        # The version is only the offer's label; a package root without it is still patchable.
+        $root = New-ScratchDir 'nvapp'
+        try {
+            $dir = New-FakeStagedPackage -Root $root -Leaf 'ccc333' -Modified ([datetime]'2026-11-10') -Version ''
+            $hit = Find-NvAppStagedPackage -RootPath $root
+            $hit.Path | Should Be $dir
+            $hit.Version | Should Be ''
+        } finally { Remove-ScratchDir $root }
     }
 }

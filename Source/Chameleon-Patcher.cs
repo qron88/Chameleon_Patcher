@@ -20,9 +20,9 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("Chameleon Patcher")]
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
-[assembly: AssemblyInformationalVersion("1.1.1")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyInformationalVersion("1.2.0")]
 
 namespace ChameleonPatcherGui
 {
@@ -164,6 +164,64 @@ namespace ChameleonPatcherGui
 #endif
             Live = this;
             BuildUi();
+
+            // Once the window has painted, ask the pipeline whether NVIDIA App has already staged
+            // a driver download (newest, verified against the pipeline's own package-root rule)
+            // and offer it as this run's source. It is an offer, not a decision: accepting only
+            // fills the source box; the known run flow (source verification, tool check, output
+            // naming) still happens when the user presses Start. Declining leaves the window
+            // exactly as it was before.
+            Shown += delegate { OfferStagedNvAppDriverAsync(); };
+        }
+
+        // The startup offer appears once per window, not on every event pass.
+        private bool nvAppOfferShown;
+
+        /// <summary>
+        /// Asks the pipeline about a driver NVIDIA App has already downloaded (-CheckNvAppStaged)
+        /// and, if there is one and no source has been typed yet, offers it. Verdict word on the
+        /// first stdout line, like the GUI's other pipeline queries; a query that cannot be
+        /// answered is treated as "nothing staged" - the user can still pick the source by hand.
+        /// </summary>
+        private async void OfferStagedNvAppDriverAsync()
+        {
+            if (nvAppOfferShown) return;
+            nvAppOfferShown = true;
+            if (txtDriverPath.Text.Trim().Length > 0) return;   // never overwrite what the user typed
+
+            string stdout = await Task.Run(() => QueryPipeline("-CheckNvAppStaged", null, false, false, 30000));
+            if (closing || IsDisposed || stdout == null) return;
+
+            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            if (lines.Length == 0 || lines[0].Trim() != "NVAPP_STAGED") return;
+
+            string path = "", version = "", staged = "";
+            foreach (string raw in lines)
+            {
+                string t = raw.Trim();
+                if (t.StartsWith("Path: ")) path = t.Substring("Path: ".Length).Trim();
+                else if (t.StartsWith("Version: ")) version = t.Substring("Version: ".Length).Trim();
+                else if (t.StartsWith("Staged: ")) staged = t.Substring("Staged: ".Length).Trim();
+            }
+            if (path.Length == 0 || !Directory.Exists(path)) return;
+
+            string what = version.Length > 0 ? "driver version " + version : "driver package";
+            var answer = MessageBox.Show(
+                this,
+                "NVIDIA App has already downloaded and unpacked " + what +
+                (staged.Length > 0 ? " (staged " + staged + ")" : "") + ":\n" + path + "\n\n" +
+                "Use it as this run's driver source? The patcher copies the package and never " +
+                "touches NVIDIA App's own files; the copy is verified as NVIDIA's and then patched " +
+                "and re-signed the usual way.\n\n" +
+                "Choose No to pick a driver .exe or folder yourself, as usual.",
+                "Driver already downloaded",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button1);
+            if (answer != DialogResult.Yes || closing || IsDisposed) return;
+
+            txtDriverPath.Text = path;
+            lblStatus.ForeColor = System.Drawing.Color.DarkRed;
+            lblStatus.Text = "Source set from NVIDIA App's download - press Start to patch.";
         }
 
         // Per-user, writable, survives upgrades of the exe. Scripts\ below it is rewritten from the

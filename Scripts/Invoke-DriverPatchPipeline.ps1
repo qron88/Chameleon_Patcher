@@ -178,6 +178,13 @@ param(
     # stop. The GUI asks this so it can offer to continue with an unverified source.
     [switch]$CheckSource,
 
+    # Print whether NVIDIA App has already downloaded and staged a driver package on this machine
+    # (NVAPP_STAGED / NVAPP_NONE + path/version) and stop. The GUI asks at startup so it can offer
+    # that package as the run's source before the user goes to download one. The staging rules
+    # live in Find-NvAppStagedPackage (PatchToolDiscovery.ps1), not in the GUI, for the usual
+    # reason: the GUI asks rather than keeping a second copy of a pipeline rule.
+    [switch]$CheckNvAppStaged,
+
     # Patch a source that is not verifiably NVIDIA's: an .exe without a valid NVIDIA signature, or a
     # folder whose files NVIDIA's signed catalog does not cover (e.g. one already patched). The
     # output is re-signed with a certificate your machine trusts, so only pass this for a source
@@ -297,6 +304,21 @@ if ($CheckPatchTools) {
     Write-Output ("  7z:       " + $(if (-not $needSeven) { 'NOT NEEDED' } elseif ($seven) { $seven } else { 'NOT FOUND' }))
     foreach ($m in $missingHard) {
         foreach ($h in (Get-MissingToolHelp -ToolNames @($m))) { Write-Output $h }
+    }
+    return
+}
+
+if ($CheckNvAppStaged) {
+    # Placement matters: this answers WITHOUT a source, like -CheckPatchTools above, and must
+    # therefore return before the "pass exactly one of -SourceExePath/-SourcePackagePath" check.
+    $pkg = Find-NvAppStagedPackage
+    if ($pkg) {
+        Write-Output 'NVAPP_STAGED'
+        Write-Output ("  Path: " + $pkg.Path)
+        Write-Output ("  Version: " + $(if ($pkg.Version) { $pkg.Version } else { 'unknown' }))
+        Write-Output ("  Staged: " + $pkg.Modified.ToString('yyyy-MM-dd HH:mm'))
+    } else {
+        Write-Output 'NVAPP_NONE'
     }
     return
 }

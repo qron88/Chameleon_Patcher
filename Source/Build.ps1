@@ -30,7 +30,7 @@
 .PARAMETER OutputPath
   Where to write the .exe. Only valid with a single -Variant. Defaults to the variant's name plus
   the version (AssemblyInformationalVersion in the source) in the project root, e.g.
-  Chameleon-Patcher-1.1.1.exe (standalone) and Chameleon-Patcher-Overlay-1.1.1.exe.
+  Chameleon-Patcher-1.2.0.exe (standalone) and Chameleon-Patcher-Overlay-1.2.0.exe.
 
 .PARAMETER CscPath
   Override the compiler location. By default the 64-bit .NET Framework 4.x csc.exe under %WINDIR%.

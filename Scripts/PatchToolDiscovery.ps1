@@ -146,6 +146,58 @@ function Test-DriverPackageRoot {
     (Test-Path -LiteralPath (Join-Path $Path 'Display.Driver'))
 }
 
+function Find-NvAppStagedPackage {
+    <#
+      Newest driver package that NVIDIA App has already downloaded and unpacked, or $null.
+      NVIDIA App's update framework stages each Game Ready driver download under
+
+        %ProgramData%\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd\post-processing\<hash>\
+
+      as a fully unpacked package (setup.exe, setup.cfg, Display.Driver) - exactly the layout
+      -SourcePackagePath takes, so a staged folder can be a run's source without unpacking
+      anything. The GUI asks (via the pipeline's -CheckNvAppStaged) whether to offer it at
+      startup; what counts as a package root is the SAME Test-DriverPackageRoot rule a real run
+      applies, so the offer and the run cannot disagree.
+
+      Returns @{ Path; Version; Modified } for the newest candidate. Previous patch outputs sit
+      beside the staged folders and also pass Test-DriverPackageRoot (their re-signed setup.exe,
+      setup.cfg and Display.Driver are all present), so "*_Patched*" leaves are skipped: the
+      offer is NVIDIA's staged download, and Test-DriverSource would refuse a patched copy as a
+      source anyway. Version comes from setup.cfg's root <setup version="..."> attribute.
+    #>
+    param([string]$RootPath)
+    if (-not $RootPath) {
+        $common = $env:ProgramData
+        if (-not $common) { return $null }
+        $RootPath = Join-Path $common 'NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd\post-processing'
+    }
+    if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
+
+    $best = $null
+    foreach ($d in (Get-ChildItem -LiteralPath $RootPath -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -like '*_Patched*') { continue }
+        if (-not (Test-DriverPackageRoot -Path $d.FullName)) { continue }
+
+        $setupExe = Join-Path $d.FullName 'setup.exe'
+        $stamp = (Get-Item -LiteralPath $setupExe).LastWriteTimeUtc
+        if ($best -ne $null -and $stamp -le $best.Modified) { continue }
+
+        $version = ''
+        try {
+            # setup.cfg is NVIDIA's installer manifest; the version attribute sits on the <setup>
+            # element near its top. Read a few head lines rather than the whole file, and match
+            # tolerantly: this is only the label for the GUI's offer, and the full XML is parsed
+            # by later steps of an actual run.
+            $head = (Get-Content -LiteralPath (Join-Path $d.FullName 'setup.cfg') -TotalCount 5) -join ' '
+            $m = [regex]::Match($head, '<setup[^>]*version="([^"]+)"')
+            if ($m.Success) { $version = $m.Groups[1].Value }
+        } catch { }
+
+        $best = [PSCustomObject]@{ Path = $d.FullName; Version = $version; Modified = $stamp }
+    }
+    return $best
+}
+
 function Find-WdkTool {
     <#
       Locates a Windows Kits tool, preferring the NEWEST SDK version and, within that version,

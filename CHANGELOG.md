@@ -10,6 +10,32 @@ be in the README are under [Reference notes](#reference-notes) at the end of thi
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-25
+
+### Added
+- The GUI now offers the option to patch the driver that was downloaded directly via the NVIDIA App.
+  NVIDIA App's update framework stages each downloaded driver as a fully unpacked package under
+  `C:\ProgramData\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd\post-processing\<hash>`
+  - already a valid `-SourcePackagePath` source, so a user who let NVIDIA App download the driver
+  used to have to find that hidden folder with the folder picker to skip the multi-GB download +
+  unpack. On window open the GUI asks the pipeline (`-CheckNvAppStaged`, verdict words
+  `NVAPP_STAGED` / `NVAPP_NONE`) and, if a package is staged, offers it by version and date;
+  accepting fills the source box, declining leaves the window exactly as before. It is a prefill,
+  not a run: the staged package is copied (never modified in place), verified as NVIDIA's and
+  patched/re-signed by the unchanged flow on Start.
+- `Find-NvAppStagedPackage` (in `PatchToolDiscovery.ps1`) + the `-CheckNvAppStaged` query in
+  `Invoke-DriverPatchPipeline.ps1`. The staging rule lives with the other pipeline rules, so the
+  GUI and a direct run cannot disagree about what counts as a package: it reuses
+  `Test-DriverPackageRoot` and picks the newest candidate by `setup.exe` timestamp. `<hash>_Patched`
+  folders from earlier runs sit beside the staged packages and pass `Test-DriverPackageRoot` too
+  (their re-signed `setup.exe`/`setup.cfg`/`Display.Driver` are all present), so `*_Patched*` leaves
+  are skipped - they would only earn the user a `SOURCE_UNTRUSTED` refusal.
+- `Tests\PatchToolDiscovery.Tests.ps1`: 5 tests for `Find-NvAppStagedPackage` (missing root,
+  non-package folders ignored, newest picked with version from `setup.cfg`, `*_Patched` skipped,
+  missing version attribute still offered). `Tests\Run.ps1`: 95 passed. Verified read-only against
+  a real staged 621.40 package: `-CheckNvAppStaged` named the right hash folder, version and date.
+  The GUI prefill itself is untested (GUI code has no tests); the standalone exe rebuilt clean.
+
 ## [1.1.1] - 2026-11-20
 
 Merge of the 1.1.0 standalone build with the useful parts of an independent implementation of the

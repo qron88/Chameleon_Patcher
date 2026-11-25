@@ -107,10 +107,14 @@ Queries that run without patching anything:
 .\Scripts\Invoke-DriverPatchPipeline.ps1 -CheckPatchTools                        # TOOLS_OK / TOOLS_MISSING + install help
 .\Scripts\Invoke-DriverPatchPipeline.ps1 -CheckLocalGpuSupport                   # SUPPORTED / UNSUPPORTED / UNKNOWN, one line per GPU
 .\Scripts\Invoke-DriverPatchPipeline.ps1 -SourceExePath "<exe>" -CheckSource     # SOURCE_OK / SOURCE_UNTRUSTED
+.\Scripts\Invoke-DriverPatchPipeline.ps1 -CheckNvAppStaged                       # NVAPP_STAGED (path+version) / NVAPP_NONE
 ```
 
 Starting from an already-unpacked folder: `-SourcePackagePath "<folder>"` - the same pipeline minus
-the unpack step. `-SkipSetupCertOption` leaves `setup.cfg` untouched if you prefer `pnputil` or
+the unpack step. NVIDIA App's own update framework stages each downloaded driver exactly like such a
+folder (`-CheckNvAppStaged` finds the newest one under
+`C:\ProgramData\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd\post-processing`); the
+GUI offers it at startup. `-SkipSetupCertOption` leaves `setup.cfg` untouched if you prefer `pnputil` or
 `Approve-DriverPatchCert.ps1` separately.
 
 ## What you need
@@ -884,9 +888,19 @@ output - that phrase is an interface between the C# and the two scripts that rai
 the hint while the run still fails for the same reason.
 
 The GUI asks the pipeline instead of reimplementing its rules (`-ShowOutputPath`,
-`-CheckLocalGpuSupport`, `-CheckPatchTools`, `-CheckSource`): the first stdout line of each is a
-verdict word. The pipeline forces UTF-8 stdout because a windowless child otherwise writes in the OEM
-codepage. Change both sides together if you touch that protocol.
+`-CheckLocalGpuSupport`, `-CheckPatchTools`, `-CheckSource`, `-CheckNvAppStaged`): the first stdout
+line of each is a verdict word. The pipeline forces UTF-8 stdout because a windowless child otherwise
+writes in the OEM codepage. Change both sides together if you touch that protocol.
+
+When the window opens, the GUI asks whether NVIDIA App has already downloaded a driver
+(`-CheckNvAppStaged` - its own update framework stages a fully unpacked package under
+`C:\ProgramData\NVIDIA Corporation\NVIDIA App\UpdateFramework\ota-artifacts\grd\post-processing\<hash>`,
+which is a valid `-SourcePackagePath` source as-is). If one is staged, the GUI offers it by version and
+date; accepting fills the source box, declining leaves the window as it was. The offer is only a
+prefill: the staged package is still copied (NVIDIA App's own files are never touched), verified as
+NVIDIA's, and then patched and re-signed by the usual flow when Start is pressed. Previous run outputs
+beside the staged folder (`<hash>_Patched`) are never offered - they would fail source verification as
+already-patched folders.
 
 Before a run starts, the GUI checks which external tools this machine can resolve and refuses to begin
 when one is missing, naming each tool and offering a button that opens its download page - **Open the
@@ -993,18 +1007,18 @@ continuations). It also owns the byte-preserving reader/writer pair described un
 ## Version
 
 The version is declared once, as assembly attributes at the top of `Source\Chameleon-Patcher.cs`
-(currently **1.1.1**):
+(currently **1.2.0**):
 
 ```csharp
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
-[assembly: AssemblyInformationalVersion("1.1.1")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyInformationalVersion("1.2.0")]
 ```
 
 Everything else reads that one declaration back, so it appears in four places: the **file name** of
-the built executables (`Chameleon-Patcher-1.1.1.exe`, `Chameleon-Patcher-Overlay-1.1.1.exe`), the
-**window title bar** (`Chameleon Patcher 1.1.1`), the file's **Win32 version resource** (`csc.exe` folds it in, no
-`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher-1.1.1.exe).VersionInfo` show
+the built executables (`Chameleon-Patcher-1.2.0.exe`, `Chameleon-Patcher-Overlay-1.2.0.exe`), the
+**window title bar** (`Chameleon Patcher 1.2.0`), the file's **Win32 version resource** (`csc.exe` folds it in, no
+`.rc` to maintain, so Explorer's Details tab and `(Get-Item Chameleon-Patcher-1.2.0.exe).VersionInfo` show
 it), and **every patch log header**, stamped at runtime. Bumping a release means editing those
 attributes and rebuilding with `.\Source\Build.ps1`; keep `AssemblyVersion` at `x.y.0.0` and let the
 file and informational versions carry the precise one.
