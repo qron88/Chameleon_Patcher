@@ -86,11 +86,13 @@ if ($notOurs) {
 
 # Root trust only matters for a kernel driver under Test Signing (or with enforcement disabled for
 # the boot). Say so up front if it is off, rather than after the driver fails to load.
+#
+# Read from the registry (Get-BootSigningState), not from bcdedit's output: bcdedit prints the value
+# in the display language, so matching the English "Yes" can warn on a localized Windows that has
+# Test Signing on (never measured either way; the registry makes the question moot). Secure Boot is reported too - with it on, Test Signing cannot be
+# enabled at all, which is the more useful thing to hear before trusting a root.
 try {
-    $bcd = & (Get-SystemToolPath 'bcdedit.exe') /enum '{current}' 2>$null
-    if (-not ($bcd | Select-String -Pattern '^\s*testsigning\s+Yes' -Quiet)) {
-        Write-Warning "Test Signing mode is OFF on this boot. Trusting the certificate alone will not let the patched driver load - also run 'bcdedit /set testsigning on' (Secure Boot off) and reboot, or disable driver signature enforcement for one boot."
-    }
+    foreach ($w in (Get-BootSigningAdvice -State (Get-BootSigningState))) { Write-Warning $w }
 }
 catch { }
 

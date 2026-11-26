@@ -1,0 +1,72 @@
+name: Release
+
+# On a version tag (v1.2.1): run the tests, build the standalone executable from that exact
+# commit, and attach it to the GitHub release together with its SHA256, so a download can be
+# checked against a hash that was computed where it was built rather than on someone's PC.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the version in the source
+        shell: powershell
+        run: |
+          $m = Select-String -LiteralPath Source\Chameleon-Patcher.cs -Pattern 'AssemblyInformationalVersion\("([^"]+)"\)' |
+              Select-Object -First 1
+          if (-not $m) { throw 'AssemblyInformationalVersion not found.' }
+          $version = $m.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+              throw "Tag $($env:GITHUB_REF_NAME) does not match the source version $version."
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+
+      - name: Pester 3.4 - 4.x is available
+        shell: powershell
+        run: |
+          $pester = Get-Module -ListAvailable Pester |
+              Where-Object { $_.Version -ge [version]'3.4' -and $_.Version -lt [version]'5.0' }
+          if (-not $pester) {
+              Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Tests
+        shell: powershell
+        run: .\Tests\Run.ps1
+
+      - name: Build
+        shell: powershell
+        run: .\Source\Build.ps1
+
+      - name: SHA256
+        shell: powershell
+        run: |
+          $exe = "Chameleon-Patcher-$($env:VERSION).exe"
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          # "<hash>  <file>" is the format sha256sum -c and most checkers read. ASCII, no BOM.
+          [System.IO.File]::WriteAllText("$PWD\$exe.sha256", "$hash  $exe`n", (New-Object System.Text.ASCIIEncoding))
+          Get-Content -LiteralPath "$exe.sha256"
+
+      - name: Attach to the release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $exe = "Chameleon-Patcher-$($env:VERSION).exe"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+              gh release create $tag --title $tag --notes "See CHANGELOG.md for what changed in $tag." --verify-tag
+              if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
+          }
+          # --clobber: the file built here, from the tagged commit, is the one the hash describes.
+          gh release upload $tag $exe "$exe.sha256" --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }

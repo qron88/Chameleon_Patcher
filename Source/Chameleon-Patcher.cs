@@ -1,4 +1,6 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -6,6 +8,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 // Version metadata. csc.exe folds these into the PE's Win32 version resource, so the number shows
@@ -21,8 +24,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("Project Chameleon")]
 [assembly: AssemblyDescription("NVIDIA driver GPU-unlock patcher")]
 [assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
-[assembly: AssemblyInformationalVersion("1.2.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyInformationalVersion("1.2.1")]
 
 namespace ChameleonPatcherGui
 {
@@ -50,7 +53,10 @@ namespace ChameleonPatcherGui
         }
     }
 
-    public class MainForm : Form
+    // One class, several files: this one holds the entry point, the fields, start-up and the
+    // embedded-script unpacking; MainForm.Ui.cs, MainForm.Dialogs.cs, MainForm.Pipeline.cs,
+    // MainForm.Log.cs and MainForm.Run.cs hold the rest. Source\Build.ps1 compiles every .cs here.
+    public partial class MainForm : Form
     {
         // Height of the live log panel shown by "Show details". Every vertical position, and the
         // window height, is computed by LayoutForm from the controls actually visible.
@@ -155,7 +161,12 @@ namespace ChameleonPatcherGui
             try { ExtractEmbeddedScripts(scriptsDir); }
             catch (Exception ex)
             {
-                MessageBox.Show("Could not unpack the embedded scripts to " + scriptsDir + ":\n" + ex.Message,
+                // Remembered, not just shown: whatever is in Scripts\ now is a mix of this build's
+                // files and an older build's (or nothing), and running that mix is how a new GUI
+                // ends up talking to an old pipeline. Start refuses until a clean start succeeds.
+                scriptsError = ex.Message;
+                MessageBox.Show("Could not unpack the embedded scripts to " + scriptsDir + ":\n" + ex.Message +
+                    "\n\nPatching is disabled until this is fixed - close any program holding files in that folder and start Chameleon Patcher again.",
                     "Chameleon Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
 #else
@@ -174,6 +185,10 @@ namespace ChameleonPatcherGui
             Shown += delegate { OfferStagedNvAppDriverAsync(); };
         }
 
+        // Why the embedded scripts could not be unpacked at start (standalone build), or null.
+        // While set, nothing is run from Scripts\: see the constructor.
+        private string scriptsError = null;
+
         // The startup offer appears once per window, not on every event pass.
         private bool nvAppOfferShown;
 
@@ -189,31 +204,36 @@ namespace ChameleonPatcherGui
             nvAppOfferShown = true;
             if (txtDriverPath.Text.Trim().Length > 0) return;   // never overwrite what the user typed
 
-            string stdout = await Task.Run(() => QueryPipeline("-CheckNvAppStaged", null, false, false, 30000));
-            if (closing || IsDisposed || stdout == null) return;
+            if (scriptsError != null) return;
+            Dictionary<string, object> reply = await Task.Run(() => QueryPipelineJson("-CheckNvAppStaged", null, false, false, 30000));
+            if (closing || IsDisposed || reply == null) return;
+            if (JsonString(reply, "verdict") != "NVAPP_STAGED") return;
 
-            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (lines.Length == 0 || lines[0].Trim() != "NVAPP_STAGED") return;
-
-            string path = "", version = "", staged = "";
-            foreach (string raw in lines)
-            {
-                string t = raw.Trim();
-                if (t.StartsWith("Path: ")) path = t.Substring("Path: ".Length).Trim();
-                else if (t.StartsWith("Version: ")) version = t.Substring("Version: ".Length).Trim();
-                else if (t.StartsWith("Staged: ")) staged = t.Substring("Staged: ".Length).Trim();
-            }
+            string path = JsonString(reply, "path");
+            string version = JsonString(reply, "version");
+            string staged = JsonString(reply, "staged");
             if (path.Length == 0 || !Directory.Exists(path)) return;
 
-            string what = version.Length > 0 ? "driver version " + version : "driver package";
+            // The message box wraps wherever its own width runs out, and it treats the spaces
+            // inside "NVIDIA Corporation\NVIDIA App" as places to wrap: the first version of this
+            // text came out with its opening sentence broken two words before the end and the
+            // folder cut in the middle of a folder name. So the facts get one short line each
+            // and the folder is broken here, only after a backslash. The prose is left to the
+            // box, which fills its own width evenly; prose pre-wrapped here came out ragged.
+            var text = new StringBuilder();
+            text.Append("NVIDIA App has already downloaded a driver.\n\n");
+            if (version.Length > 0) text.Append("Version:  ").Append(version).Append('\n');
+            if (staged.Length > 0) text.Append("Staged:   ").Append(staged).Append('\n');
+            text.Append("Folder:\n").Append(BreakPath(path, OfferTextWidth)).Append("\n\n");
+            text.Append("Use it as the driver source for this run?\n\n");
+            text.Append(
+                "The patcher works on a copy and never touches NVIDIA App's own files. The driver " +
+                "files and installer programs in the copy are checked against NVIDIA's signatures, " +
+                "then it is patched and re-signed. The result goes to your Downloads folder.\n\n");
+            text.Append("Choose No to pick a driver .exe or folder yourself.");
             var answer = MessageBox.Show(
                 this,
-                "NVIDIA App has already downloaded and unpacked " + what +
-                (staged.Length > 0 ? " (staged " + staged + ")" : "") + ":\n" + path + "\n\n" +
-                "Use it as this run's driver source? The patcher copies the package and never " +
-                "touches NVIDIA App's own files; the copy is verified as NVIDIA's and then patched " +
-                "and re-signed the usual way.\n\n" +
-                "Choose No to pick a driver .exe or folder yourself, as usual.",
+                text.ToString(),
                 "Driver already downloaded",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question,
                 MessageBoxDefaultButton.Button1);
@@ -222,6 +242,37 @@ namespace ChameleonPatcherGui
             txtDriverPath.Text = path;
             lblStatus.ForeColor = System.Drawing.Color.DarkRed;
             lblStatus.Text = "Source set from NVIDIA App's download - press Start to patch.";
+        }
+
+        // Characters per folder line in the startup offer. A message box fits about 57 of the
+        // system font's average characters before it wraps on its own; a path is mostly wide
+        // characters, so the limit stays under that.
+        private const int OfferTextWidth = 50;
+
+        /// <summary>
+        /// A path on as few lines as fit <paramref name="width"/>, broken only AFTER a backslash,
+        /// never at a space and never inside a folder name. A single component longer than the
+        /// width (a 32-character hash folder is not, a long file name can be) keeps its own line.
+        /// </summary>
+        internal static string BreakPath(string path, int width)
+        {
+            var result = new StringBuilder();
+            var line = new StringBuilder();
+            int start = 0;
+            while (start < path.Length)
+            {
+                int cut = path.IndexOf('\\', start);
+                string piece = cut < 0 ? path.Substring(start) : path.Substring(start, cut - start + 1);
+                if (line.Length > 0 && line.Length + piece.Length > width)
+                {
+                    result.Append(line).Append('\n');
+                    line.Length = 0;
+                }
+                line.Append(piece);
+                start += piece.Length;
+            }
+            result.Append(line);
+            return result.ToString();
         }
 
         // Per-user, writable, survives upgrades of the exe. Scripts\ below it is rewritten from the
@@ -253,11 +304,13 @@ namespace ChameleonPatcherGui
                     try { owned = mutex.WaitOne(TimeSpan.FromSeconds(30)); }
                     catch (AbandonedMutexException) { owned = true; }
 
+                    var shipped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                     foreach (string name in asm.GetManifestResourceNames())
                     {
                         if (!name.StartsWith(prefix, StringComparison.Ordinal)) continue;
                         string rel = name.Substring(prefix.Length).Replace('/', Path.DirectorySeparatorChar);
                         string dest = Path.Combine(target, rel);
+                        shipped.Add(Path.GetFullPath(dest));
 
                         byte[] data;
                         using (Stream s = asm.GetManifestResourceStream(name))
@@ -280,18 +333,34 @@ namespace ChameleonPatcherGui
                             }
                         }
                         Directory.CreateDirectory(Path.GetDirectoryName(dest));
-                        // Atomic: write beside the target, then move into place, so a crash or a
-                        // full disk never leaves a half-written script behind.
+                        // Atomic: write beside the target, then swap it in, so a crash or a full
+                        // disk never leaves a half-written script behind. File.Replace is one
+                        // operation for an existing file; delete-then-move had a moment with no
+                        // script at all, and a crash in it left the script missing.
                         string tmp = dest + ".tmp-" + Process.GetCurrentProcess().Id;
                         try
                         {
                             File.WriteAllBytes(tmp, data);
-                            if (File.Exists(dest)) File.Delete(dest);
-                            File.Move(tmp, dest);
+                            if (File.Exists(dest)) File.Replace(tmp, dest, null);
+                            else File.Move(tmp, dest);
                         }
                         finally
                         {
                             try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                        }
+                    }
+
+                    // Files this build does not ship: a script an older build unpacked and a newer
+                    // one dropped or renamed. Left behind, it stays runnable by name and can still
+                    // be dot-sourced by accident. Only inside Scripts\ - Certificates\ and the logs
+                    // are siblings of it and are never touched from here. Best-effort: a file that
+                    // cannot be removed is not worth refusing to start over.
+                    if (Directory.Exists(target))
+                    {
+                        foreach (string existing in Directory.GetFiles(target, "*", SearchOption.AllDirectories))
+                        {
+                            if (shipped.Contains(Path.GetFullPath(existing))) continue;
+                            try { File.Delete(existing); } catch { }
                         }
                     }
                 }
@@ -303,1669 +372,5 @@ namespace ChameleonPatcherGui
         }
 
 #endif
-
-        private void BuildUi()
-        {
-            // Version in the title bar, from the same assembly attribute the log header uses, so
-            // a screenshot of the window is enough to tell which build someone is running.
-            Text = "Chameleon Patcher " + ReportVersion();
-
-            // Reuse the icon already embedded in this executable by csc's /win32icon, so the
-            // window and taskbar match the file icon without shipping a separate .ico alongside
-            // the .exe. Purely cosmetic, so a failure here must never stop the app starting.
-            try
-            {
-                Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-            }
-            catch
-            {
-            }
-
-            ClientSize = new System.Drawing.Size(560, 458);
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen;
-
-            var grpDriver = new GroupBox { Text = "Driver package", Left = 15, Top = 15, Width = 530, Height = 100 };
-            // Explicit height: a Label defaults to 23 px, which would reach down to y=45 and, being
-            // added first (so on top), clip the top edge of the "Select .exe..." button at y=43.
-            var lblDriverHint = new Label
-            {
-                Text = "Downloaded driver installer (.exe), or an already-unpacked folder:",
-                Left = 10,
-                Top = 22,
-                Width = 500,
-                Height = 18
-            };
-            txtDriverPath = new TextBox { Name = "txtDriverPath", Left = 10, Top = 45, Width = 400 };
-            var btnBrowseExe = new Button { Text = "Select .exe...", Left = 415, Top = 43, Width = 100 };
-            btnBrowseExe.Click += (s, e) => BrowseFile(txtDriverPath, "NVIDIA driver installer (*.exe)|*.exe");
-            var btnBrowseFolder = new Button { Text = "Or select an unpacked folder...", Left = 10, Top = 70, Width = 505 };
-            btnBrowseFolder.Click += (s, e) => BrowseFolder(txtDriverPath);
-            grpDriver.Controls.AddRange(new Control[] { lblDriverHint, txtDriverPath, btnBrowseExe, btnBrowseFolder });
-
-            // The .pfx fields are hidden unless asked for. The normal case needs neither: the
-            // pipeline signs with the key already in Cert:\CurrentUser\My, finds it there even if
-            // the Certificates folder is gone, and mints one on a PC that has none - all with no
-            // password. A .pfx only matters for signing with an EXISTING certificate exported from
-            // another PC (e.g. one the target machines already trust) instead of the one here or a
-            // new one. The label says that rather than "for a PC without the key": a PC without a
-            // key needs nothing ticked, since the pipeline mints a certificate for it.
-            // An always-visible password box suggested a password was needed when it almost never is.
-            chkUsePfx = new CheckBox
-            {
-                Text = "Sign with an existing certificate from a .pfx file",
-                Left = 20,
-                Top = 123,
-                Width = 525
-            };
-            chkUsePfx.CheckedChanged += (s, e) =>
-            {
-                // Unticking discards the password rather than keeping it out of sight. The path
-                // can stay - it is ignored while the box is unticked and harmless to keep.
-                if (!chkUsePfx.Checked) txtPassword.Clear();
-                LayoutForm();
-            };
-
-            grpCert = new GroupBox { Text = "Signing certificate (.pfx)", Left = 15, Width = 530, Height = 116, Visible = false };
-            var lblCertHintTicked = new Label
-            {
-                Text = "Ticked: the certificate in the .pfx file below is used - its password is needed.",
-                Left = 10,
-                Top = 18,
-                Width = 505,
-                Height = 18
-            };
-            var lblCertHintUnticked = new Label
-            {
-                Text = "Unticked: the key on this PC is used, or a new certificate is created.",
-                Left = 10,
-                Top = 36,
-                Width = 505,
-                Height = 18
-            };
-            txtCertPath = new TextBox { Name = "txtCertPath", Left = 10, Top = 58, Width = 400 };
-            var btnBrowseCert = new Button { Text = "Browse...", Left = 415, Top = 56, Width = 100 };
-            btnBrowseCert.Click += (s, e) => BrowseFile(txtCertPath, "PFX certificate (*.pfx)|*.pfx");
-            var lblPassword = new Label { Text = "Password:", Left = 10, Top = 89, Width = 120, Height = 18 };
-            txtPassword = new TextBox { Name = "txtPassword", Left = 135, Top = 86, Width = 280, PasswordChar = '*' };
-            grpCert.Controls.AddRange(new Control[] { lblCertHintTicked, lblCertHintUnticked, txtCertPath, btnBrowseCert, lblPassword, txtPassword });
-
-            chkAddInstallerOption = new CheckBox
-            {
-                Text = "Add a certificate-trust checkbox to the installer, ticked by default (recommended)",
-                Left = 20,
-                Width = 525,
-                Checked = true
-            };
-            // Off by default, matching the pipeline's own default. Ticking it makes the run about
-            // seven times faster by dropping the ~41 OEM display INFs that cannot match this PC,
-            // at the cost of a package that only installs here.
-            chkPruneInfs = new CheckBox
-            {
-                Text = "Build for this PC only - much faster, but not portable to other machines",
-                Left = 20,
-                Width = 525
-            };
-            chkOverwrite = new CheckBox
-            {
-                Text = "Delete the output folder first if it already exists",
-                Left = 20,
-                Width = 525
-            };
-
-            btnStart = new Button
-            {
-                Name = "btnStart",
-                Text = "Start Patching",
-                Left = 20,
-                Width = 525,
-                Height = 34,
-                Font = new System.Drawing.Font(Font, System.Drawing.FontStyle.Bold)
-            };
-            btnStart.Click += BtnStart_Click;
-
-            progressBar = new ProgressBar { Left = 20, Width = 525, Height = 20, Minimum = 0, Maximum = 100 };
-            lblStep = new Label { Text = "Ready.", Left = 20, Width = 525, Height = 18 };
-
-            btnToggleDetails = new Button { Text = "▼ Show details", Left = 20, Width = 150, FlatStyle = FlatStyle.Flat };
-            btnToggleDetails.FlatAppearance.BorderSize = 0;
-            btnToggleDetails.Click += (s, e) => ToggleDetails();
-
-            btnOpenLog = new Button
-            {
-                Text = "Open log folder",
-                Left = 175,
-                Width = 150,
-                FlatStyle = FlatStyle.Flat,
-                Enabled = false
-            };
-            btnOpenLog.FlatAppearance.BorderSize = 0;
-            btnOpenLog.Click += (s, e) => OpenLogLocation();
-
-            detailsPanel = new Panel { Left = 20, Width = 525, Height = DetailsPanelHeight, Visible = false };
-            txtLog = new TextBox
-            {
-                Multiline = true,
-                ReadOnly = true,
-                ScrollBars = ScrollBars.Vertical,
-                Dock = DockStyle.Fill,
-                Font = new System.Drawing.Font("Consolas", 8f),
-                BackColor = System.Drawing.Color.Black,
-                ForeColor = System.Drawing.Color.LightGray
-            };
-            detailsPanel.Controls.Add(txtLog);
-
-            // Its own status row BELOW the "Show details" / "Open log folder" buttons, placed by
-            // LayoutForm. Not anchored to ClientSize.Height: the window grows when details expand,
-            // and a bottom-anchored label would then land inside the log panel.
-            lblStatus = new Label
-            {
-                Text = "",
-                Left = 20,
-                Width = 525,
-                Height = 20,
-                ForeColor = System.Drawing.Color.DarkRed
-            };
-
-            Controls.AddRange(new Control[]
-            {
-                grpDriver, chkUsePfx, grpCert, chkAddInstallerOption, chkPruneInfs, chkOverwrite,
-                btnStart, progressBar, lblStep, btnToggleDetails, btnOpenLog, detailsPanel, lblStatus
-            });
-
-            LayoutForm();
-            FormClosing += MainForm_FormClosing;
-        }
-
-        /// <summary>
-        /// Places everything below the .pfx checkbox in one top-to-bottom pass and sizes the
-        /// window to fit, so showing or hiding the .pfx fields or the log panel moves the rest
-        /// instead of leaving a gap or overlapping it. Each row starts where the previous one
-        /// ends, which also rules out the kind of overlap that clipped the "Select .exe..." button.
-        /// </summary>
-        private void LayoutForm()
-        {
-            SuspendLayout();
-
-            int y = chkUsePfx.Bottom;
-            grpCert.Visible = chkUsePfx.Checked;
-            if (grpCert.Visible)
-            {
-                grpCert.Top = y + 3;
-                y = grpCert.Bottom + 8;
-            }
-
-            chkAddInstallerOption.Top = y;
-            chkPruneInfs.Top = chkAddInstallerOption.Bottom;
-            chkOverwrite.Top = chkPruneInfs.Bottom;
-
-            btnStart.Top = chkOverwrite.Bottom + 8;
-            progressBar.Top = btnStart.Bottom + 10;
-            lblStep.Top = progressBar.Bottom + 4;
-            btnToggleDetails.Top = lblStep.Bottom + 4;
-            btnOpenLog.Top = btnToggleDetails.Top;
-            lblStatus.Top = btnToggleDetails.Bottom + 3;
-
-            detailsPanel.Top = lblStatus.Bottom + 4;
-            int height = detailsPanel.Visible ? detailsPanel.Bottom + 26 : lblStatus.Bottom;
-            ClientSize = new System.Drawing.Size(ClientSize.Width, height);
-
-            ResumeLayout();
-        }
-
-        private void ToggleDetails()
-        {
-            detailsPanel.Visible = !detailsPanel.Visible;
-            btnToggleDetails.Text = detailsPanel.Visible ? "▲ Hide details" : "▼ Show details";
-            LayoutForm();
-        }
-
-        private void BrowseFile(TextBox target, string filter)
-        {
-            using (var dlg = new OpenFileDialog { Filter = filter })
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    target.Text = dlg.FileName;
-                }
-            }
-        }
-
-        private void BrowseFolder(TextBox target)
-        {
-            using (var dlg = new FolderBrowserDialog())
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    target.Text = dlg.SelectedPath;
-                }
-            }
-        }
-
-        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            if (running)
-            {
-                var result = MessageBox.Show(
-                    this,
-                    "Patching is still running. Closing now will abort it partway through. Close anyway?",
-                    "Patching in progress",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning);
-                if (result != DialogResult.Yes)
-                {
-                    e.Cancel = true;
-                    return;
-                }
-
-                // Going down mid-run. Stop the whole child tree - powershell.exe and whatever it
-                // started (7z, Inf2Cat, signtool) - then record that explicitly, so the log ends
-                // with a reason instead of just stopping and looking like a hang or a crash.
-                closing = true;
-                LogLine("[abort]", "window closed by the user while the patch was still running - stopping the pipeline");
-                bool stopped = KillProcessTree(pipelineProcess);
-                LogLine("[abort]", stopped ? "pipeline process tree stopped" : "could not confirm the pipeline process tree stopped");
-                FinishLog(-1, "ABORTED - window closed mid-run; the output folder is incomplete");
-            }
-
-            // The form is going away: detach the static crash handlers from it so a late crash
-            // reports a dialog only, rather than writing into a disposed form's log.
-            if (Live == this) Live = null;
-        }
-
-        /// <summary>
-        /// Stops a process and every process it started. Process.Kill() on .NET Framework stops
-        /// only the one process, which here would leave 7z, Inf2Cat or signtool running on with
-        /// nothing to report to. taskkill /T walks the tree. Returns true once the process is gone.
-        /// </summary>
-        private static bool KillProcessTree(Process p)
-        {
-            if (p == null) return true;
-            try
-            {
-                if (p.HasExited) return true;
-            }
-            catch
-            {
-                return true;
-            }
-
-            try
-            {
-                var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "taskkill.exe"), "/PID " + p.Id + " /T /F")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-                using (var killer = Process.Start(psi))
-                {
-                    if (killer != null) killer.WaitForExit(10000);
-                }
-            }
-            catch
-            {
-            }
-
-            try
-            {
-                if (!p.HasExited) p.Kill();
-                return p.WaitForExit(5000);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Quotes one argument for the Windows command-line convention powershell.exe parses
-        /// with. Backslashes are literal except directly before a quote, so a path ending in "\"
-        /// - a drive root such as D:\ - must have its trailing backslashes doubled; otherwise the
-        /// closing quote reads as an escaped literal quote and swallows the arguments after it.
-        /// </summary>
-        private static string Quote(string s)
-        {
-            var sb = new StringBuilder("\"");
-            int backslashes = 0;
-            foreach (char c in s)
-            {
-                if (c == '\\')
-                {
-                    backslashes++;
-                    continue;
-                }
-                if (c == '"')
-                {
-                    sb.Append('\\', backslashes * 2 + 1).Append('"');
-                }
-                else
-                {
-                    sb.Append('\\', backslashes).Append(c);
-                }
-                backslashes = 0;
-            }
-            sb.Append('\\', backslashes * 2).Append('"');
-            return sb.ToString();
-        }
-
-        /// <summary>
-        /// Runs an action on the UI thread unless the window is already going down. The child's
-        /// output callbacks arrive on threadpool threads and can outlive the form by a moment.
-        /// </summary>
-        private void PostToUi(Action action)
-        {
-            if (closing || IsDisposed || !IsHandleCreated) return;
-            try
-            {
-                BeginInvoke((MethodInvoker)delegate
-                {
-                    if (!closing && !IsDisposed) action();
-                });
-            }
-            catch (InvalidOperationException)
-            {
-                // Includes ObjectDisposedException: the handle went away between the check and the post.
-            }
-        }
-
-        /// <summary>
-        /// Asks the pipeline to resolve its external tools (-CheckPatchTools) and returns its
-        /// stdout, or null if the question could not be answered. Touches nothing on disk, so this
-        /// is safe to call before a run.
-        /// </summary>
-        private string CheckPatchToolsQuery(string driverPath, bool isExe)
-        {
-            // The SDK search walks Windows Kits recursively; on a cold disk that alone can take longer
-            // than the default bound, and a timed-out query silently skipped this check. The source is
-            // passed along because only an .exe needs the 7z CLI: for an unpacked folder the pipeline
-            // answers "7z: NOT NEEDED" instead of refusing a run that would work without it.
-            return QueryPipeline("-CheckPatchTools", isExe ? null : driverPath, isExe, false, 120000);
-        }
-
-        /// <summary>
-        /// Asks the pipeline whether the source is genuinely NVIDIA's (-CheckSource). An untrusted
-        /// source gets one explicit question; answering yes is the only way the GUI passes
-        /// -SkipSourceVerification. Returns null to stop, otherwise the extra arguments to pass.
-        /// </summary>
-        private async Task<string> ConfirmSourceAsync(string driverPath, bool isExe)
-        {
-            lblStep.Text = "Verifying the driver is NVIDIA's...";
-            // A folder is checked file by file against NVIDIA's catalog - tens of seconds.
-            string stdout = await Task.Run(() => QueryPipeline("-CheckSource", driverPath, isExe, false, 600000));
-            if (closing || IsDisposed) return null;
-            if (stdout == null) return "";   // Unanswerable here: the pipeline checks again and stops on its own.
-
-            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (lines.Length == 0 || lines[0].Trim() != "SOURCE_UNTRUSTED") return "";
-
-            var detail = new StringBuilder();
-            for (int i = 1; i < lines.Length && i <= 8; i++) detail.AppendLine(lines[i].Trim());
-            var answer = MessageBox.Show(
-                this,
-                "This driver is not verifiably NVIDIA's:\n\n" + detail +
-                "\nThe patcher re-signs everything in it with a certificate your PC trusts as a root, " +
-                "so a modified or repackaged driver would be trusted too.\n\n" +
-                "Use the original download from nvidia.com unless you trust this file for another reason.\n\n" +
-                "Continue with this file anyway?",
-                "Unverified driver source",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning,
-                MessageBoxDefaultButton.Button2);
-            return answer == DialogResult.Yes ? " -SkipSourceVerification" : null;
-        }
-
-        /// <summary>
-        /// The refused-run window. A MessageBox cannot carry a button of its own, and a user who has
-        /// to retype an install command is a user who mistypes it, so this window is laid out like the
-        /// MessageBox it replaces - error icon at the left, the system message font, nothing in its
-        /// title bar, buttons along the bottom right - and carries one button more: it opens the
-        /// download page of whatever is missing in the default browser, both pages when both tools are
-        /// missing, because this message is read on machines that may not have a terminal open. The
-        /// message itself is plain
-        /// labels on the face of the window, not a field to fill in: nothing is selected, nothing has
-        /// to be scrolled, nothing blinks, and no line is cut at the edge, because every line gets a
-        /// label exactly as wide and as tall as the text it holds.
-        /// </summary>
-        private void ShowMissingToolsDialog(string message, string linksText)
-        {
-            using (Form dialog = new Form())
-            {
-                dialog.Text = "Required tools missing";
-                dialog.FormBorderStyle = FormBorderStyle.FixedDialog;
-                dialog.MaximizeBox = false;
-                dialog.MinimizeBox = false;
-                dialog.ShowInTaskbar = false;
-                dialog.StartPosition = FormStartPosition.CenterParent;
-                dialog.ShowIcon = false;   // a MessageBox has nothing in its title bar either
-                // Everything below is positioned in pixels measured at this window's own DPI, so the
-                // form must not scale those pixels a second time on a scaled display.
-                dialog.AutoScaleMode = System.Windows.Forms.AutoScaleMode.None;
-
-                System.Drawing.Font textFont = System.Drawing.SystemFonts.MessageBoxFont;
-
-                PictureBox icon = new PictureBox();
-                // An Icon is not an Image - it is its own thing - so the system error icon is handed
-                // to the picture box as a bitmap.
-                icon.Image = System.Drawing.SystemIcons.Error.ToBitmap();
-                icon.SizeMode = PictureBoxSizeMode.CenterImage;
-                icon.Left = 12;
-                icon.Top = 14;
-                icon.Width = 32;
-                icon.Height = 32;
-                icon.TabStop = false;
-                dialog.Controls.Add(icon);
-
-                // One label per line, which is what a MessageBox actually paints: plain text on the
-                // face of the window, with no field around it, nothing selected, nothing to scroll and
-                // no caret sitting in the middle of the message. Each label is left to size itself to
-                // its own text, so the window grows to fit the widest line instead of clipping it, and
-                // the download address is never split across a window edge. Blank lines of the message
-                // are paragraph breaks, and a label with no text has no height at all, so they carry a
-                // single space to hold the gap open.
-                int textLeft = 56;
-                int y = 14;
-                int widestRight = textLeft;
-                foreach (string line in message.Replace("\r\n", "\n").Split('\n'))
-                {
-                    Label textLine = new Label();
-                    textLine.Font = textFont;
-                    textLine.AutoSize = true;
-                    textLine.Margin = new System.Windows.Forms.Padding(0);
-                    textLine.Text = line.Length > 0 ? line : " ";
-                    textLine.Left = textLeft;
-                    textLine.Top = y;
-                    dialog.Controls.Add(textLine);
-                    y = textLine.Bottom;
-                    if (textLine.Right > widestRight) widestRight = textLine.Right;
-                }
-                int textBottom = y;
-
-                // The button opens the page the guidance named. Handing over an address to copy is the
-                // wrong shape for this message: the run is being refused on a machine that may not have
-                // a terminal open, and the fix is a download, not something to type.
-                Button openButton = null;
-                int linkCount = 0;
-                if (linksText.Length > 0)
-                {
-                    foreach (string line in linksText.Replace("\r\n", "\n").Split('\n'))
-                    {
-                        if (line.Trim().Length > 0) linkCount++;
-                    }
-                    openButton = new Button();
-                    openButton.Text = OpenButtonText(linksText, linkCount);
-                    openButton.AutoSize = true;
-                    openButton.Margin = new System.Windows.Forms.Padding(0);
-                    openButton.Top = textBottom + 14;
-                    openButton.Left = 0;   // set below, once OK has its place
-                    openButton.Click += delegate
-                    {
-                        int opened = 0;
-                        foreach (string line in linksText.Replace("\r\n", "\n").Split('\n'))
-                        {
-                            string url = line.Trim();
-                            if (url.Length == 0) continue;
-                            // The text comes from the child's stdout; only ever hand the shell a web
-                            // address, never a path or a command that happens to sit on that line.
-                            if (!url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) continue;
-                            try
-                            {
-                                // A URL handed to Process.Start goes through the shell, so whatever the
-                                // user set as their browser answers here.
-                                Process.Start(url);
-                                opened++;
-                            }
-                            catch (Exception ex)
-                            {
-                                MessageBox.Show(dialog,
-                                    "Couldn't open that page in your browser:\n" + url + "\n\n" + ex.Message +
-                                    "\n\nType the address into any browser yourself.",
-                                    "Couldn't open the page", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                            }
-                        }
-                        if (opened > 0) openButton.Text = "Opened in your browser";
-                    };
-                    dialog.Controls.Add(openButton);
-                }
-
-                Button okButton = new Button();
-                okButton.Text = "OK";
-                okButton.AutoSize = true;
-                okButton.Margin = new System.Windows.Forms.Padding(0);
-                okButton.DialogResult = DialogResult.OK;
-                // A MessageBox runs its buttons along the bottom right, the main action last. Same
-                // here, so this reads like the window it replaced and the copy button is one more
-                // thing beside the answer rather than a different kind of window.
-                int rightEdge = widestRight + 12;
-                okButton.Top = textBottom + 14;
-                okButton.Left = rightEdge - okButton.PreferredSize.Width;
-                if (openButton != null)
-                {
-                    openButton.Left = okButton.Left - 10 - openButton.PreferredSize.Width;
-                    if (openButton.Left < 12) openButton.Left = 12;
-                }
-                dialog.Controls.Add(okButton);
-                dialog.AcceptButton = okButton;
-                dialog.CancelButton = okButton;   // Escape closes it, as it closed the MessageBox
-                dialog.ActiveControl = okButton;  // OK holds the focus, as it does in a MessageBox
-                dialog.ClientSize = new System.Drawing.Size(rightEdge + 12, okButton.Bottom + 12);
-
-                dialog.ShowDialog(this);
-            }
-        }
-
-        /// <summary>
-        /// The width the refused-run dialog is wrapped to. A MessageBox picks its own width and
-        /// breaks long lines wherever it likes, which is how a folder path or a winget command used
-        /// to end up cut in half in the middle of the text the user was supposed to act on. Wrapping
-        /// here means every line is short enough that the dialog keeps the breaks this code chose.
-        /// </summary>
-        private const int DialogTextWidth = 50;
-
-        /// <summary>
-        /// The tool identifiers the pipeline reports (Inf2Cat.exe, 7z) as the names a person is
-        /// looking for on an install screen.
-        /// </summary>
-        private static string HumanToolName(string tool)
-        {
-            if (tool == "Inf2Cat.exe" || tool == "Inf2Cat") return "Inf2Cat (rebuilds the driver catalog)";
-            if (tool == "signtool.exe" || tool == "signtool") return "signtool (signs the rebuilt catalog)";
-            if (tool == "7z") return "a 7z-compatible CLI (7-Zip or NanaZip)";
-            return tool;
-        }
-
-        // The found tools are only listed, not explained: what a name means is already stated for
-        // the tools that are missing, and repeating it stretches the message for no reason.
-        // The button names the page it is about to bring up, so it never reads as a generic "open"
-        // that might open the wrong thing.
-        private static string OpenButtonText(string linksText, int linkCount)
-        {
-            if (linkCount > 1) return "Open both download pages";
-            if (linksText.IndexOf("7-zip.org", StringComparison.OrdinalIgnoreCase) >= 0) return "Open the 7-Zip download page";
-            if (linksText.IndexOf("windows-sdk", StringComparison.OrdinalIgnoreCase) >= 0) return "Open the Windows SDK download page";
-            return "Open the download page";
-        }
-
-        private static string ShortToolName(string tool)
-        {
-            if (tool == "Inf2Cat.exe" || tool == "Inf2Cat") return "Inf2Cat";
-            if (tool == "signtool.exe" || tool == "signtool") return "signtool";
-            if (tool == "7z") return "a 7z-compatible CLI";
-            return tool;
-        }
-
-        private static string AppendName(string existing, string addition)
-        {
-            if (existing.Length == 0) return addition;
-            return existing + ", " + addition;
-        }
-
-        /// <summary>
-        /// Word-wrap. A word longer than the width gets a line to itself rather than being split,
-        /// so a URL or a path is never broken across two lines.
-        /// </summary>
-        private static string WrapText(string text, int width)
-        {
-            var result = new StringBuilder();
-            var line = new StringBuilder();
-            foreach (string word in text.Split(' '))
-            {
-                if (word.Length == 0) continue;
-                if (line.Length > 0 && line.Length + 1 + word.Length > width)
-                {
-                    result.AppendLine(line.ToString());
-                    line.Length = 0;
-                }
-                if (line.Length > 0) line.Append(' ');
-                line.Append(word);
-            }
-            if (line.Length > 0) result.Append(line.ToString());
-            return result.ToString();
-        }
-
-        /// <summary>
-        /// Wraps whatever prose was collected as one paragraph and appends it, so a paragraph that
-        /// the pipeline happened to break into eight short lines still arrives as full-width text.
-        /// </summary>
-        private static void FlushProse(StringBuilder prose, StringBuilder guidance)
-        {
-            if (prose.Length == 0) return;
-            guidance.AppendLine(WrapText(prose.ToString().Trim(), DialogTextWidth).TrimEnd());
-            prose.Length = 0;
-        }
-
-        private static string IndentLines(string wrapped, int indent)
-        {
-            if (indent <= 0) return wrapped;
-            string pad = new string(' ', indent);
-            var sb = new StringBuilder();
-            foreach (string line in wrapped.Replace("\r\n", "\n").Split('\n'))
-            {
-                if (line.Length > 0) sb.Append(pad);
-                sb.AppendLine(line);
-            }
-            return sb.ToString().TrimEnd('\n');
-        }
-
-        /// <summary>
-        /// Runs the pipeline in one of its ask-and-stop modes (-ShowOutputPath,
-        /// -CheckLocalGpuSupport) and returns its stdout, or null if the question could not be
-        /// answered. Those modes touch nothing on disk, so this is safe to call before a run.
-        /// </summary>
-        private string QueryPipeline(string queryArgs, string driverPath, bool isExe, bool prune, int timeoutMs = 20000)
-        {
-            string pipelineScript = Path.Combine(scriptsDir, "Invoke-DriverPatchPipeline.ps1");
-            if (!File.Exists(pipelineScript)) return null;
-
-            try
-            {
-                var args = new StringBuilder();
-                args.Append("-NoProfile -ExecutionPolicy Bypass -File ").Append(Quote(pipelineScript));
-                if (driverPath != null)
-                {
-                    args.Append(isExe ? " -SourceExePath " : " -SourcePackagePath ").Append(Quote(driverPath));
-                }
-                if (prune) args.Append(" -PruneForeignOemInfs");
-                args.Append(' ').Append(queryArgs);
-
-                var psi = new ProcessStartInfo
-                {
-                    FileName = PowerShellExe,
-                    Arguments = args.ToString(),
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    StandardOutputEncoding = Encoding.UTF8,
-                    StandardErrorEncoding = Encoding.UTF8
-                };
-
-                using (var proc = Process.Start(psi))
-                {
-                    // Drain BOTH streams while the child runs. The pipeline's Write-Host banners
-                    // land on stderr in a redirected, non-interactive context; if stderr were
-                    // never read, a child that filled the stderr buffer would block on write and
-                    // never exit, and the stdout read below would hang the GUI with no reason.
-                    // Waiting with a timeout BEFORE consuming the streams is also what makes the
-                    // 20 s bound real - reading to the end first only returns once the child has
-                    // already exited, so a timeout checked afterwards can never fire.
-                    var stdoutTask = proc.StandardOutput.ReadToEndAsync();
-                    var stderrTask = proc.StandardError.ReadToEndAsync();
-                    if (!proc.WaitForExit(timeoutMs))
-                    {
-                        KillProcessTree(proc);
-                        return null;
-                    }
-                    stdoutTask.Wait();
-                    stderrTask.Wait();
-                    if (proc.ExitCode != 0) return null;
-                    return stdoutTask.Result;
-                }
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Asks the pipeline where it would put its output. The naming rule, including the GPU tag
-        /// a pruned build gets, lives only in the pipeline; this keeps the GUI in step with it
-        /// rather than maintaining a second copy that drifts.
-        ///
-        /// Falls back to the plain "_Patched" name if the query fails for any reason. Getting a
-        /// slightly less descriptive folder is a far better failure than refusing to patch.
-        /// </summary>
-        private async Task<string> ResolveOutputPathAsync(string driverPath, bool isExe, bool prune)
-        {
-            string fallback = isExe
-                ? Path.Combine(Path.GetDirectoryName(driverPath), Path.GetFileNameWithoutExtension(driverPath) + "_Patched")
-                : driverPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + "_Patched";
-
-            // Off the UI thread: the query starts powershell.exe and reads WMI, which can take
-            // several seconds, and the window would show "Not responding" for all of it.
-            string stdout = await Task.Run(() => QueryPipeline("-ShowOutputPath", driverPath, isExe, prune));
-            if (stdout == null) return fallback;
-
-            // The path is the last non-empty line; anything else on stdout is noise.
-            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            for (int i = lines.Length - 1; i >= 0; i--)
-            {
-                string candidate = lines[i].Trim();
-                if (candidate.Length > 0 && Path.IsPathRooted(candidate)) return candidate;
-            }
-            return fallback;
-        }
-
-        /// <summary>
-        /// True when <paramref name="outputPath"/> is a folder the pipeline could have created for
-        /// this source: same parent folder, a leaf ending in "_Patched" or containing "_Patched_",
-        /// and not the source itself.
-        /// </summary>
-        private static bool IsPlausibleOutputFolder(string outputPath, string driverPath)
-        {
-            try
-            {
-                string outFull = Path.GetFullPath(outputPath).TrimEnd('\\');
-                string srcFull = Path.GetFullPath(driverPath).TrimEnd('\\');
-                if (string.Equals(outFull, srcFull, StringComparison.OrdinalIgnoreCase)) return false;
-                string outParent = Path.GetDirectoryName(outFull);
-                string srcParent = Path.GetDirectoryName(srcFull);
-                if (outParent == null || !string.Equals(outParent, srcParent, StringComparison.OrdinalIgnoreCase)) return false;
-                string leaf = Path.GetFileName(outFull);
-                return leaf.EndsWith("_Patched", StringComparison.OrdinalIgnoreCase) ||
-                       leaf.IndexOf("_Patched_", StringComparison.OrdinalIgnoreCase) >= 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// "Build for this PC only" strips out every display INF that cannot match this machine.
-        /// If none of this machine's GPUs is one whitelist.json unlocks, that build has nothing
-        /// left to unlock: it would spend the whole run re-signing a driver the GPU here already
-        /// runs. The pipeline refuses such a run in its preflight; this asks the same question
-        /// first, so the answer arrives as a choice rather than as a failed run.
-        ///
-        /// A universal build is never questioned. Building one on a machine whose GPU needs no
-        /// unlock is the ordinary case - the package is for the machine that does.
-        ///
-        /// Returns false only if the user wants to stop. "Yes" switches the checkbox off and
-        /// carries on, so the header, the arguments and the output folder all follow the choice
-        /// that was actually made.
-        /// </summary>
-        private async Task<bool> ConfirmPrunedBuildIsWorthItAsync()
-        {
-            if (!chkPruneInfs.Checked) return true;
-
-            string stdout = await Task.Run(() => QueryPipeline("-CheckLocalGpuSupport", null, false, false));
-            if (closing || IsDisposed) return false;
-            if (stdout == null) return true;   // Unanswerable: leave the decision to the pipeline.
-
-            string[] lines = stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-            if (lines.Length == 0) return true;
-            string verdict = lines[0].Trim();
-            if (verdict != "UNSUPPORTED") return true;   // SUPPORTED, or nothing detectable to judge.
-
-            var detail = new StringBuilder();
-            for (int i = 1; i < lines.Length; i++) detail.AppendLine(lines[i].TrimEnd());
-
-            var answer = MessageBox.Show(
-                this,
-                "No GPU in this PC is one this patcher unlocks:\n\n" +
-                detail.ToString() +
-                "\n\"Build for this PC only\" cuts the package down to what can match THIS machine, " +
-                "so it would produce NVIDIA's own driver for a GPU that already works, re-signed " +
-                "with a certificate Windows does not trust yet - a long run for no unlock.\n\n" +
-                "Build the portable package instead? It keeps every whitelist entry and installs " +
-                "on the machine that has the locked GPU.\n\n" +
-                "Yes - build the portable package (recommended)\n" +
-                "No - stop, change nothing\n\n" +
-                "(To force the for-this-PC-only build anyway, run Invoke-DriverPatchPipeline.ps1 " +
-                "with -AllowUnsupportedGpu.)",
-                "Nothing to unlock on this PC",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning);
-
-            if (answer != DialogResult.Yes) return false;
-
-            chkPruneInfs.Checked = false;
-            return true;
-        }
-
-        private void AppendLog(string line)
-        {
-            if (line == null) return;
-            txtLog.AppendText(line + Environment.NewLine);
-        }
-
-        // ---------------------------------------------------------------------------------------
-        // Event log
-        //
-        // The on-screen details panel is lost the moment the window closes, which is exactly when
-        // a failed patch needs looking at. Everything the child process emits is therefore also
-        // written to a timestamped file, incrementally and with AutoFlush on, so the log survives
-        // a crash, a kill, or a hang partway through - not just a clean failure.
-        //
-        // Nothing secret goes in here. The password never appears on the child's command line (it
-        // travels in an environment variable, see RunPipelineAsync), so logging the full argument
-        // string is safe; the header records only WHETHER one was supplied.
-        // ---------------------------------------------------------------------------------------
-
-        private const int LogsToKeep = 20;
-
-        private static string[] CandidateLogDirs()
-        {
-            // Portable-tool first: a Logs folder beside the .exe is where someone will look. Fall
-            // back to per-user locations for the case where the app sits somewhere unwritable.
-            return new string[]
-            {
-                Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Chameleon Patcher", "Logs"),
-                Path.Combine(Path.GetTempPath(), "Chameleon Patcher Logs")
-            };
-        }
-
-        private void StartLog(string driverPath, string outputPath, string certPath, string arguments, bool passwordSupplied)
-        {
-            runClock = Stopwatch.StartNew();
-            logPath = null;
-            logWriter = null;
-
-            string name = "patch-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log";
-            foreach (string dir in CandidateLogDirs())
-            {
-                try
-                {
-                    Directory.CreateDirectory(dir);
-                    string candidate = Path.Combine(dir, name);
-                    var writer = new StreamWriter(candidate, false, new UTF8Encoding(false));
-                    writer.AutoFlush = true;
-                    logWriter = writer;
-                    logPath = candidate;
-                    break;
-                }
-                catch
-                {
-                    // Try the next location.
-                }
-            }
-
-            if (logWriter == null)
-            {
-                AppendLog("[warn] Could not open a log file in any of the candidate locations; this run is not being logged to disk.");
-                return;
-            }
-            runLogOpen = true;
-
-            bool elevated = false;
-            try
-            {
-                var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-                elevated = new System.Security.Principal.WindowsPrincipal(identity)
-                    .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-            }
-            catch
-            {
-            }
-
-            WriteRaw("=== Chameleon Patcher - patch log ===");
-            WriteRaw("started        : " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss zzz"));
-            WriteRaw("version        : " + ReportVersion());
-            WriteRaw("executable     : " + Application.ExecutablePath);
-            WriteRaw("scripts folder : " + scriptsDir);
-            WriteRaw("log file       : " + logPath);
-            WriteRaw("machine / user : " + Environment.MachineName + " / " + Environment.UserName);
-            WriteRaw("os             : " + DescribeOs());
-            WriteRaw("clr            : " + Environment.Version);
-            WriteRaw("elevated       : " + elevated);
-            WriteRaw("");
-            WriteRaw("driver input   : " + driverPath);
-            WriteRaw("output folder  : " + outputPath);
-            WriteRaw("installer opt  : " + (chkAddInstallerOption.Checked ? "add cert-trust checkbox" : "skipped"));
-            WriteRaw("overwrite      : " + chkOverwrite.Checked);
-            WriteRaw("prune OEM INFs : " + (chkPruneInfs.Checked ? "yes - package will be specific to this PC" : "no - all INFs kept, portable"));
-            WriteRaw("cert file      : " + (certPath.Length == 0 ? "(none - sign from the certificate store)" : certPath));
-            WriteRaw("password given : " + (passwordSupplied ? "yes (value never logged)" : "no"));
-            WriteRaw("");
-            WriteRaw("child command  : powershell.exe " + arguments);
-            WriteRaw("");
-            WriteRaw("Elapsed times below are from the start of the child process. The pipeline's own");
-            WriteRaw("'=== N/M: ... ===' banners mark each step, so the gap between two banners is how");
-            WriteRaw("long that step took - useful because the catalog rebuild normally dominates.");
-            WriteRaw("");
-            WriteRaw("--------------------------------------------------------------------------------");
-        }
-
-        private static string ReportVersion()
-        {
-            // Read back from the assembly rather than hardcoding, so bumping the attributes above
-            // is the only edit a release needs. Informational version is preferred because it
-            // carries the plain "x.y.z" rather than the four-part file version.
-            try
-            {
-                Assembly asm = Assembly.GetExecutingAssembly();
-                var info = (AssemblyInformationalVersionAttribute[])asm.GetCustomAttributes(
-                    typeof(AssemblyInformationalVersionAttribute), false);
-                if (info.Length > 0 && !string.IsNullOrEmpty(info[0].InformationalVersion))
-                {
-                    return info[0].InformationalVersion;
-                }
-                return asm.GetName().Version.ToString();
-            }
-            catch
-            {
-                return "(unknown)";
-            }
-        }
-
-        private static string DescribeOs()
-        {
-            // Environment.OSVersion is useless here: without an application compatibility
-            // manifest Windows reports 6.2.9200 (Windows 8) to every process, so a log from
-            // Windows 11 would claim to be Windows 8. For a driver-signing tool the real build is
-            // one of the first things you want to know, since Test Signing behaviour and driver
-            // signature policy vary by build, so read it from the registry instead.
-            string arch = Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit";
-            try
-            {
-                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
-                    @"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
-                {
-                    if (key != null)
-                    {
-                        string product = key.GetValue("ProductName") as string;
-                        string display = key.GetValue("DisplayVersion") as string;
-                        string build = key.GetValue("CurrentBuild") as string;
-                        object ubr = key.GetValue("UBR");
-
-                        // Windows 11 still reports ProductName "Windows 10 ..."; build 22000+ is
-                        // the real dividing line.
-                        int buildNum;
-                        if (product != null && build != null &&
-                            int.TryParse(build, out buildNum) && buildNum >= 22000 &&
-                            product.IndexOf("Windows 10", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            product = product.Replace("Windows 10", "Windows 11");
-                        }
-
-                        var sb = new StringBuilder();
-                        sb.Append(product ?? "Windows");
-                        if (!string.IsNullOrEmpty(display)) sb.Append(" ").Append(display);
-                        if (!string.IsNullOrEmpty(build))
-                        {
-                            sb.Append(" (build ").Append(build);
-                            if (ubr != null) sb.Append(".").Append(ubr);
-                            sb.Append(")");
-                        }
-                        sb.Append(" ").Append(arch);
-                        return sb.ToString();
-                    }
-                }
-            }
-            catch
-            {
-            }
-            return Environment.OSVersion.VersionString + " " + arch + " (registry unavailable; this figure is unreliable)";
-        }
-
-        private void WriteRaw(string text)
-        {
-            lock (logLock)
-            {
-                if (logWriter == null) return;
-                try
-                {
-                    logWriter.WriteLine(text);
-                }
-                catch
-                {
-                    // A logging failure must never take the run down with it.
-                }
-            }
-        }
-
-        private void LogLine(string tag, string text)
-        {
-            if (text == null) return;
-            TimeSpan t = runClock == null ? TimeSpan.Zero : runClock.Elapsed;
-            WriteRaw(string.Format("[{0:00}:{1:00}:{2:00}.{3:000}] {4} {5}",
-                (int)t.TotalHours, t.Minutes, t.Seconds, t.Milliseconds, tag, text));
-        }
-
-        private void FinishLog(int exitCode, string outcome)
-        {
-            TimeSpan t = runClock == null ? TimeSpan.Zero : runClock.Elapsed;
-            WriteRaw("--------------------------------------------------------------------------------");
-            WriteRaw("");
-            WriteRaw("finished  : " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss zzz"));
-            WriteRaw("duration  : " + string.Format("{0:00}:{1:00}:{2:00}", (int)t.TotalHours, t.Minutes, t.Seconds));
-            WriteRaw("exit code : " + exitCode);
-            WriteRaw("outcome   : " + outcome);
-            if (exitCode != 0)
-            {
-                WriteRaw("");
-                WriteRaw("To diagnose: find the last '=== N/M: ... ===' banner above - that is the step that");
-                WriteRaw("failed - then read forward for the first [stderr] line or thrown message. A failure");
-                WriteRaw("at the verification step means the patch did not apply and signing was refused on");
-                WriteRaw("purpose; see 'The verification gate' in README.md.");
-            }
-
-            lock (logLock)
-            {
-                if (logWriter != null)
-                {
-                    try
-                    {
-                        logWriter.Flush();
-                        logWriter.Dispose();
-                    }
-                    catch
-                    {
-                    }
-                    logWriter = null;
-                }
-                runLogOpen = false;
-            }
-
-            PruneOldLogs();
-        }
-
-        private void PruneOldLogs()
-        {
-            // Keep the log folder from growing without bound. Only files this app names are
-            // considered, so nothing else in the folder is ever touched.
-            if (logPath == null) return;
-            try
-            {
-                var dir = new DirectoryInfo(Path.GetDirectoryName(logPath));
-                FileInfo[] logs = dir.GetFiles("patch-*.log");
-                if (logs.Length <= LogsToKeep) return;
-                Array.Sort(logs, (a, b) => b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc));
-                for (int i = LogsToKeep; i < logs.Length; i++)
-                {
-                    try
-                    {
-                        logs[i].Delete();
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private void OpenLogLocation()
-        {
-            if (logPath == null || !File.Exists(logPath))
-            {
-                MessageBox.Show(this, "No log file from this session yet - run a patch first.",
-                    "No log", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-            try
-            {
-                // Open Explorer with the log already selected, rather than just the folder.
-                Process.Start(new ProcessStartInfo("explorer.exe", "/select,\"" + logPath + "\"") { UseShellExecute = true });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show(this, "Couldn't open the log folder:\n" + ex.Message + "\n\nThe log is at:\n" + logPath,
-                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private void OpenLogFile()
-        {
-            if (logPath == null || !File.Exists(logPath)) return;
-            try
-            {
-                Process.Start(new ProcessStartInfo(logPath) { UseShellExecute = true });
-            }
-            catch
-            {
-                OpenLogLocation();
-            }
-        }
-
-        private static readonly Regex StepRegex = new Regex(@"^===\s*(\d+)/(\d+):\s*(.+?)\s*===\s*$", RegexOptions.Compiled);
-
-        private async void BtnStart_Click(object sender, EventArgs e)
-        {
-            // Inputs stay locked while the pre-run checks run in the background, so a second click
-            // or an edited path cannot slip in between a check and the run it was made for.
-            SetInputsEnabled(false);
-            lblStep.Text = PreparingText;
-            try
-            {
-                await StartPatchingAsync();
-            }
-            finally
-            {
-                if (!closing && !IsDisposed && !running)
-                {
-                    SetInputsEnabled(true);
-                    if (lblStep.Text == PreparingText) lblStep.Text = "Ready.";
-                }
-            }
-        }
-
-        private async Task StartPatchingAsync()
-        {
-            string driverPath = txtDriverPath.Text.Trim();
-            // The .pfx fields count only while their checkbox is ticked. Whatever is left in them
-            // otherwise is ignored, so an untick really does mean "sign from the store".
-            bool usePfx = chkUsePfx.Checked;
-            string certPath = usePfx ? txtCertPath.Text.Trim() : "";
-            string password = usePfx ? txtPassword.Text : "";
-
-            if (string.IsNullOrEmpty(driverPath) || !(File.Exists(driverPath) || Directory.Exists(driverPath)))
-            {
-                MessageBox.Show(this, "Select a valid driver .exe or unpacked folder first.", "Missing input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            // A typed folder path may end in a separator. Drop it (except on a drive root, where
-            // it is part of the path) so the derived "<folder>_Patched" name comes out right.
-            if (Directory.Exists(driverPath))
-            {
-                string root = Path.GetPathRoot(driverPath);
-                if (!string.Equals(driverPath, root, StringComparison.OrdinalIgnoreCase))
-                {
-                    driverPath = driverPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                }
-            }
-            bool isExe = File.Exists(driverPath) && driverPath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
-            if (!isExe && !Directory.Exists(driverPath))
-            {
-                MessageBox.Show(this, "The driver path must be either a .exe file or a folder.", "Invalid input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            // Ticked but incomplete: stop before anything runs, and offer the two ways out - fill
-            // the fields in, or untick and sign the normal way. Without this an empty password
-            // only surfaces once the pipeline fails on it.
-            if (usePfx && (certPath.Length == 0 || password.Length == 0))
-            {
-                string missing =
-                    certPath.Length == 0 && password.Length == 0 ? "No .pfx file is selected and no password is entered." :
-                    certPath.Length == 0 ? "No .pfx file is selected." :
-                    "No password is entered for the .pfx file.";
-                var choice = MessageBox.Show(
-                    this,
-                    missing + "\n\n" +
-                    "\"Sign with an existing certificate from a .pfx file\" is ticked, so the .pfx file " +
-                    "and its password are both needed.\n\n" +
-                    "Yes - untick it and sign with the key on this PC (or have a new certificate created)\n" +
-                    "No - go back and fill them in",
-                    "Certificate details missing",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning);
-                if (choice != DialogResult.Yes) return;
-
-                chkUsePfx.Checked = false;   // also clears the password and hides the fields
-                usePfx = false;
-                certPath = "";
-                password = "";
-            }
-            if (!string.IsNullOrEmpty(certPath) && !File.Exists(certPath))
-            {
-                MessageBox.Show(this, "The selected certificate file doesn't exist.", "Invalid input", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-            // No password check here on purpose. The normal case needs no password at all: the
-            // pipeline signs with the private key already in Cert:\CurrentUser\My. It is passed
-            // -NonInteractive below, so if a password genuinely IS required (a .pfx whose key
-            // isn't in this machine's store, or a first-ever cert that needs a .pfx backup) it
-            // fails with an explanatory message instead of blocking on a prompt this GUI cannot
-            // answer.
-
-            // Is this NVIDIA's own driver? Asked first: nothing else is worth spending on a source the
-            // user decides not to trust, and the answer may add -SkipSourceVerification.
-            string sourceArgs = await ConfirmSourceAsync(driverPath, isExe);
-            if (sourceArgs == null) return;
-
-            // Ask about a for-this-PC-only build BEFORE the output path is resolved: answering
-            // "build the portable one" unticks the checkbox, and that changes the folder name.
-            if (!await ConfirmPrunedBuildIsWorthItAsync()) return;
-
-            // A pruned build lands in "<source>_Patched_<GPU>" rather than "<source>_Patched", so
-            // the folder itself says which machine it was cut for. Ask the pipeline for the name
-            // instead of reproducing the rule here: it owns the GPU detection, and two copies of
-            // that logic would eventually disagree.
-            string outputPath = await ResolveOutputPathAsync(driverPath, isExe, chkPruneInfs.Checked);
-            if (closing || IsDisposed) return;
-
-            if (Directory.Exists(outputPath))
-            {
-                // The path came back from a child process's stdout. Before it can drive a recursive
-                // delete it has to look like what the pipeline names its output: a "*_Patched" or
-                // "*_Patched_<GPU>" folder beside the source, never the source itself.
-                if (!IsPlausibleOutputFolder(outputPath, driverPath))
-                {
-                    MessageBox.Show(this,
-                        "The output folder the pipeline reported does not look like a patch output folder:\n" + outputPath +
-                        "\n\nNothing was deleted. Remove or rename it yourself if it is safe to do so.",
-                        "Unexpected output folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-                if (!chkOverwrite.Checked)
-                {
-                    MessageBox.Show(
-                        this,
-                        "Output folder already exists:\n" + outputPath +
-                        "\n\nCheck \"Delete the output folder first\" to replace it, or remove it manually first.",
-                        "Output already exists",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning);
-                    return;
-                }
-                var confirm = MessageBox.Show(
-                    this,
-                    "This will permanently delete:\n" + outputPath + "\n\nContinue?",
-                    "Confirm delete",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning);
-                if (confirm != DialogResult.Yes) return;
-                try
-                {
-                    Directory.Delete(outputPath, true);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show(this, "Couldn't delete the existing output folder:\n" + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-
-            string pipelineScript = Path.Combine(scriptsDir, "Invoke-DriverPatchPipeline.ps1");
-            if (!File.Exists(pipelineScript))
-            {
-                MessageBox.Show(this, "Could not find Invoke-DriverPatchPipeline.ps1 in the Scripts folder next to this program:\n" + pipelineScript, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            // Ask the pipeline which tools this machine can resolve, before anything is unpacked.
-            // All three are hard requirements, each for its own reason: Inf2Cat is the only thing
-            // that rebuilds nv_disp.cat after the INFs are edited, signtool signs what it rebuilds,
-            // and a 7z-compatible CLI is what unpacks the driver download this run starts from (an
-            // already-unpacked folder never calls it, and is reported as such by the pipeline).
-            // NVIDIA's own launcher is not a fallback any more - it self-elevates, asks for the
-            // folder to extract into, and unpacks into a system-temp folder a non-elevated run may
-            // not be allowed to list - so a missing 7-Zip is as dead a run as a missing SDK, and
-            // the catalog rebuild is the step that takes tens of minutes, so finding either out
-            // afterwards is expensive. The pipeline owns the rules; this only asks and reports.
-            string toolReport = await Task.Run(() => CheckPatchToolsQuery(driverPath, isExe));
-            if (toolReport != null && toolReport.StartsWith("TOOLS_MISSING"))
-            {
-                // Split the report into what was missing, what was found, and the guidance the
-                // pipeline wrote. Status lines are shown without their paths - a 70-character path is
-                // what used to wrap through the middle of a sentence and bury the line the user has to
-                // act on. Everything else is re-flowed: prose is collected and wrapped as a paragraph
-                // filling the whole width, rather than copied line by line, which is what left the
-                // text ragged and each continuation hanging deeper than the line it started on. Only a
-                // line the pipeline indented by four - a winget command, a download address - keeps
-                // its own line, because that is something to type or to open.
-                string missingNames = "";
-                string foundNames = "";
-                var prose = new StringBuilder();
-                var guidance = new StringBuilder();
-                var links = new StringBuilder();
-                foreach (string raw in toolReport.Replace("\r\n", "\n").Trim().Split('\n'))
-                {
-                    string trimmed = raw.Trim();
-                    if (trimmed.StartsWith("TOOLS_")) continue;
-                    if (trimmed.StartsWith("Inf2Cat:") || trimmed.StartsWith("signtool:") || trimmed.StartsWith("7z:"))
-                    {
-                        int colon = trimmed.IndexOf(':');
-                        string tool = trimmed.Substring(0, colon).Trim();
-                        string value = trimmed.Substring(colon + 1).Trim();
-                        if (value == "NOT NEEDED") continue;
-                        if (value.Length == 0 || value == "NOT FOUND") missingNames = AppendName(missingNames, HumanToolName(tool));
-                        else foundNames = AppendName(foundNames, ShortToolName(tool));
-                        continue;
-                    }
-                    if (trimmed.Length == 0)
-                    {
-                        FlushProse(prose, guidance);
-                        guidance.AppendLine();
-                        continue;
-                    }
-                    int indent = raw.Length - raw.TrimStart(' ').Length;
-                    if (indent >= 4)
-                    {
-                        // A line the pipeline indents by four is something to act on. An address belongs
-                        // in this window - shown, and offered by the button that opens it. A terminal
-                        // command does not: it is printed by the very same guidance in a console, and a
-                        // window whose button opens the page should not ask anyone to type anything. One
-                        // address can show up in two guidance blocks; it is offered once.
-                        FlushProse(prose, guidance);
-                        if (trimmed.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-                        {
-                            guidance.AppendLine(raw.TrimEnd());
-                            if (links.ToString().IndexOf(trimmed, StringComparison.Ordinal) < 0) links.AppendLine(trimmed);
-                        }
-                        continue;
-                    }
-                    if (prose.Length > 0) prose.Append(' ');
-                    prose.Append(trimmed);
-                }
-                FlushProse(prose, guidance);
-                string guidanceText = Regex.Replace(guidance.ToString(), "(\r?\n){3,}", "\n\n");
-
-                var sb = new StringBuilder();
-                sb.AppendLine(missingNames.IndexOf(',') < 0
-                    ? "One tool the patcher needs here is missing:"
-                    : "Several tools the patcher needs here are missing:");
-                sb.AppendLine();
-                if (missingNames.IndexOf(',') < 0)
-                {
-                    sb.AppendLine(IndentLines(WrapText(missingNames, DialogTextWidth - 2), 2));
-                }
-                else
-                {
-                    foreach (string name in missingNames.Split(','))
-                    {
-                        sb.AppendLine(IndentLines(WrapText(name.Trim(), DialogTextWidth - 2), 2));
-                    }
-                }
-                sb.AppendLine();
-                sb.AppendLine(guidanceText.Trim());
-                if (foundNames.Length > 0)
-                {
-                    sb.AppendLine();
-                    sb.AppendLine(WrapText("Found already: " + foundNames +
-                        ". Full paths are printed by the pipeline's query:", DialogTextWidth));
-                    sb.AppendLine();
-                    sb.AppendLine("  Invoke-DriverPatchPipeline.ps1 -CheckPatchTools");
-                }
-                sb.AppendLine();
-                sb.AppendLine(WrapText("Nothing has been unpacked and nothing was changed. Install " +
-                    "what is named above - the button below opens its download page in your browser - " +
-                    "then start the run again.", DialogTextWidth));
-                ShowMissingToolsDialog(sb.ToString().Trim(), links.ToString().Trim());
-                lblStatus.ForeColor = System.Drawing.Color.DarkRed;
-                lblStatus.Text = "Required tools missing - see the message.";
-                return;
-            }
-            // A machine with no 7z-compatible CLI never reaches here: it answered TOOLS_MISSING
-            // above and the run stopped before unpacking. What is left to say is which CLI the run
-            // will unpack with.
-            if (toolReport != null && toolReport.Contains("7z:"))
-            {
-                string sevenZipLine = "";
-                foreach (string line in toolReport.Replace("\r\n", "\n").Split('\n'))
-                {
-                    string trimmed = line.Trim();
-                    if (trimmed.StartsWith("7z:")) { sevenZipLine = trimmed.Substring(3).Trim(); break; }
-                }
-                if (sevenZipLine.Length > 0 && sevenZipLine != "NOT FOUND" && sevenZipLine != "NOT NEEDED")
-                {
-                    lblStatus.Text = "Unpacking with: " + sevenZipLine;
-                }
-            }
-
-            var argsBuilder = new StringBuilder();
-            argsBuilder.Append("-NoProfile -ExecutionPolicy Bypass -File ").Append(Quote(pipelineScript));
-            argsBuilder.Append(isExe ? " -SourceExePath " : " -SourcePackagePath ").Append(Quote(driverPath));
-            argsBuilder.Append(" -OutputPath ").Append(Quote(outputPath));
-            if (!string.IsNullOrEmpty(certPath))
-            {
-                argsBuilder.Append(" -PfxPath ").Append(Quote(certPath));
-            }
-            if (!chkAddInstallerOption.Checked)
-            {
-                argsBuilder.Append(" -SkipSetupCertOption");
-            }
-            // Opt-in, because it makes the output specific to this machine. The payoff is large:
-            // dropping the OEM display INFs that cannot match this PC took a 616.86 run from about
-            // 57 minutes to 7.6, almost all of it in the catalog rebuild.
-            if (chkPruneInfs.Checked)
-            {
-                argsBuilder.Append(" -PruneForeignOemInfs");
-            }
-            // Never prompt in the child. There is no console attached to it, so a Read-Host
-            // prompt would hang forever with the GUI showing no reason why; -NonInteractive
-            // turns any such case into a clear error we surface in the log instead.
-            argsBuilder.Append(" -NonInteractive");
-            argsBuilder.Append(sourceArgs);
-            // -PfxPassword is deliberately never passed on the command line, where any process
-            // listing or event log could read it. When a password is actually needed it travels
-            // in an environment variable set only on the child process (see RunPipelineAsync).
-            // In the normal, store-signing case there is no password involved at all and nothing
-            // is set.
-
-            SetRunning(true);
-            txtLog.Clear();
-            progressBar.Value = 0;
-            lblStep.Text = "Starting...";
-            lblStatus.Text = "";
-            lblStatus.ForeColor = System.Drawing.Color.DarkRed;
-
-            pfxPasswordWasRequired = false;
-            StartLog(driverPath, outputPath, certPath, argsBuilder.ToString(), !string.IsNullOrEmpty(password));
-            if (logPath != null)
-            {
-                AppendLog("Logging this run to: " + logPath);
-                AppendLog(new string('-', 78));
-                btnOpenLog.Enabled = true;
-            }
-
-            int exitCode = await RunPipelineAsync(argsBuilder.ToString(), password);
-            pipelineProcess = null;
-
-            // The window was closed mid-run: FormClosing has already stopped the child and
-            // finished the log, and the controls below no longer exist.
-            if (closing || IsDisposed) return;
-
-            SetRunning(false);
-            FinishLog(exitCode, exitCode == 0 ? "success" : "FAILED");
-            // The password has already travelled to the child (environment variable) and is
-            // recorded as supplied-or-not in the log header; don't leave it sitting in the box
-            // afterwards. Retyping it for a retry is the price of not keeping a signing
-            // password on screen.
-            txtPassword.Clear();
-
-            if (exitCode == 0)
-            {
-                progressBar.Value = 100;
-                lblStep.Text = "Done.";
-                lblStatus.ForeColor = System.Drawing.Color.DarkGreen;
-                lblStatus.Text = "Patching completed successfully.";
-
-                var launch = MessageBox.Show(
-                    this,
-                    "Patching completed successfully.\n\nDo you want to launch the driver installer (setup.exe) now?",
-                    "Patching complete",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question);
-                if (launch == DialogResult.Yes)
-                {
-                    string setupExe = Path.Combine(outputPath, "setup.exe");
-                    if (File.Exists(setupExe))
-                    {
-                        try
-                        {
-                            Process.Start(new ProcessStartInfo(setupExe) { UseShellExecute = true, WorkingDirectory = outputPath });
-                        }
-                        catch (Exception ex)
-                        {
-                            MessageBox.Show(this, "Couldn't launch setup.exe:\n" + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        }
-                    }
-                    else
-                    {
-                        MessageBox.Show(this, "setup.exe not found at:\n" + setupExe, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
-                }
-            }
-            else
-            {
-                // Read the step label BEFORE overwriting it, so the dialog can name the step that
-                // actually failed rather than the word "Failed".
-                string failedAt = lblStep.Text;
-                lblStep.Text = "Failed.";
-                lblStatus.Text = "Patching failed (exit code " + exitCode + ") - see details below.";
-                if (!detailsPanel.Visible) ToggleDetails();
-
-                // The one failure a user can fix right here: the signing key is not on this PC,
-                // so the .pfx password is needed. Open the hidden .pfx fields, fill in the .pfx
-                // the pipeline would have used if it is the project's default one, and say so.
-                string pfxHint = "";
-                if (pfxPasswordWasRequired)
-                {
-                    if (!chkUsePfx.Checked) chkUsePfx.Checked = true;
-                    if (txtCertPath.Text.Trim().Length == 0)
-                    {
-                        // The certificate script names its .pfx after the certificate's thumbprint
-                        // (DriverPatchSigning_<thumbprint>.pfx) so that two runs cannot overwrite each
-                        // other's private key, which means the old fixed name is only one candidate
-                        // among several now. Offer the newest file matching the pattern; the old
-                        // name still matches it.
-                        string certDir = Path.Combine(DataDir, "Certificates");
-                        string defaultPfx = null;
-                        if (Directory.Exists(certDir))
-                        {
-                            string[] candidates = Directory.GetFiles(certDir, "DriverPatchSigning*.pfx");
-                            if (candidates.Length > 0)
-                            {
-                                Array.Sort(candidates, (a, b) =>
-                                    File.GetLastWriteTimeUtc(a).CompareTo(File.GetLastWriteTimeUtc(b)));
-                                defaultPfx = candidates[candidates.Length - 1];
-                            }
-                        }
-                        if (defaultPfx != null && File.Exists(defaultPfx)) txtCertPath.Text = defaultPfx;
-                    }
-                    pfxHint = "The signing key is not on this PC, so the .pfx password is needed. " +
-                              "The .pfx fields are now shown above - enter the password and start again.\n\n";
-                }
-
-                if (logPath != null)
-                {
-                    var open = MessageBox.Show(
-                        this,
-                        "Patching failed at: " + failedAt + "\n\n" +
-                        pfxHint +
-                        "The full log of this run was saved to:\n" + logPath + "\n\n" +
-                        "Open it now?",
-                        "Patching failed",
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Error);
-                    if (open == DialogResult.Yes) OpenLogFile();
-                }
-                else
-                {
-                    MessageBox.Show(this, pfxHint + "Patching failed. See the details panel for the full log.", "Patching failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Recognises the pipeline's "the .pfx password is required, but none was supplied and
-        /// prompting is disabled" error, which both Invoke-DriverPatchPipeline.ps1 and
-        /// Sign-DriverPackage.ps1 raise when the signing key is not on this PC. Keep the phrase in
-        /// step with those two messages.
-        /// </summary>
-        private void NotePfxPasswordRequired(string line)
-        {
-            if (line.IndexOf("none was supplied and prompting is disabled", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                pfxPasswordWasRequired = true;
-            }
-        }
-
-        private void SetRunning(bool value)
-        {
-            running = value;
-            SetInputsEnabled(!value);
-        }
-
-        private void SetInputsEnabled(bool enabled)
-        {
-            btnStart.Enabled = enabled;
-            txtDriverPath.Enabled = enabled;
-            chkUsePfx.Enabled = enabled;
-            txtCertPath.Enabled = enabled;
-            txtPassword.Enabled = enabled;
-            chkAddInstallerOption.Enabled = enabled;
-            chkPruneInfs.Enabled = enabled;
-            chkOverwrite.Enabled = enabled;
-        }
-
-        private Task<int> RunPipelineAsync(string arguments, string password)
-        {
-            var tcs = new TaskCompletionSource<int>();
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = PowerShellExe,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8
-            };
-            // An environment variable on the child process, NOT stdin: Read-Host -AsSecureString
-            // does not reliably read from a redirected stdin pipe when there's no real attached
-            // console (confirmed: it just hangs). The pipeline reads this variable before
-            // prompting, so a password reaches it without ever appearing on a command line or in
-            // a log line. Only set when the user actually supplied one - the normal store-signing
-            // path needs no password, and an empty variable would be pointless noise.
-            if (!string.IsNullOrEmpty(password))
-            {
-                psi.EnvironmentVariables["DRIVER_PATCH_PFX_PASSWORD"] = password;
-            }
-
-            var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-
-            process.OutputDataReceived += (s, e) =>
-            {
-                if (e.Data == null) return;
-                NotePfxPasswordRequired(e.Data);
-                // Write to the file from THIS thread, before marshalling to the UI. If the UI
-                // thread is busy or wedged, or the app is killed mid-run, the log still has
-                // everything the child emitted up to that moment - which is the whole point of
-                // having a log rather than just the details panel.
-                LogLine("     ", e.Data);
-                PostToUi(() =>
-                {
-                    AppendLog(e.Data);
-                    var m = StepRegex.Match(e.Data);
-                    if (m.Success)
-                    {
-                        int current = int.Parse(m.Groups[1].Value);
-                        int total = int.Parse(m.Groups[2].Value);
-                        progressBar.Value = Math.Min(100, (int)(100.0 * current / total));
-                        lblStep.Text = "Step " + current + "/" + total + ": " + m.Groups[3].Value;
-                    }
-                });
-            };
-            process.ErrorDataReceived += (s, e) =>
-            {
-                if (e.Data == null) return;
-                NotePfxPasswordRequired(e.Data);
-                LogLine("[err]", e.Data);
-                PostToUi(() => AppendLog("[stderr] " + e.Data));
-            };
-            process.Exited += (s, e) =>
-            {
-                // Exited can fire while the last lines of the redirected streams are still queued -
-                // and those are usually the error message, plus the phrase that sets
-                // pfxPasswordWasRequired. The parameterless WaitForExit returns only once both
-                // asynchronous readers have reached end of stream.
-                try { process.WaitForExit(); } catch { }
-                int code = -1;
-                try { code = process.ExitCode; } catch { }
-                LogLine("[exit]", "child process exited with code " + code);
-                tcs.TrySetResult(code);
-            };
-
-            try
-            {
-                process.Start();
-            }
-            catch (Exception ex)
-            {
-                // powershell.exe missing or blocked. Previously this threw out of an async void
-                // handler and took the app down with no explanation; now it lands in the log and
-                // is reported as an ordinary failure.
-                LogLine("[err]", "could not start powershell.exe: " + ex.Message);
-                PostToUi(() => AppendLog("[stderr] Could not start powershell.exe: " + ex.Message));
-                tcs.TrySetResult(-1);
-                return tcs.Task;
-            }
-
-            pipelineProcess = process;
-            LogLine("[proc]", "powershell.exe started, pid " + process.Id);
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            return tcs.Task;
-        }
     }
 }

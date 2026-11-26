@@ -30,7 +30,7 @@
 .PARAMETER OutputPath
   Where to write the .exe. Only valid with a single -Variant. Defaults to the variant's name plus
   the version (AssemblyInformationalVersion in the source) in the project root, e.g.
-  Chameleon-Patcher-1.2.0.exe (standalone) and Chameleon-Patcher-Overlay-1.2.0.exe.
+  Chameleon-Patcher-1.2.1.exe (standalone) and Chameleon-Patcher-Overlay-1.2.1.exe.
 
 .PARAMETER CscPath
   Override the compiler location. By default the 64-bit .NET Framework 4.x csc.exe under %WINDIR%.
@@ -99,7 +99,10 @@ foreach ($v in $variants) {
            else { Join-Path $projectRoot "Chameleon-Patcher-Overlay-$version.exe" }
 
     $cscArgs = @('/nologo', '/target:winexe', "/out:$out", "/win32icon:$icon",
-                 '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll', '/platform:x64')
+                 '/reference:System.Windows.Forms.dll', '/reference:System.Drawing.dll',
+                 # JavaScriptSerializer, for the pipeline's -Json answers. Part of the .NET Framework
+                 # itself (4.x), so there is still nothing to restore or download.
+                 '/reference:System.Web.Extensions.dll', '/platform:x64')
 
     if ($v -eq 'Standalone') {
         # Every file under Scripts\ (ps1, whitelist.json, templates\*) becomes a
@@ -116,7 +119,11 @@ foreach ($v in $variants) {
     Write-Host "Compiling $v variant: $source" -ForegroundColor Cyan
     Write-Host "       -> $out"
 
-    & $CscPath @cscArgs "$source"
+    # Every .cs in Source\: MainForm is one partial class spread over several files, with
+    # Chameleon-Patcher.cs (entry point, version attributes) first.
+    $sources = @($source) + @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter *.cs -File |
+        Where-Object { $_.FullName -ne $source } | Sort-Object Name | ForEach-Object { $_.FullName })
+    & $CscPath @cscArgs @sources
     if ($LASTEXITCODE -ne 0) { throw "csc.exe failed with exit code $LASTEXITCODE ($v variant)." }
 
     # Report what the version resource actually came out as. A silent mismatch between the
