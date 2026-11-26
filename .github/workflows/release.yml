@@ -46,6 +46,17 @@ jobs:
         shell: powershell
         run: .\Source\Build.ps1
 
+      - name: Install GitHub CLI
+        shell: powershell
+        run: |
+          $url = 'https://github.com/cli/cli/releases/download/v2.44.0/gh-windows-x86_64.zip'
+          $zip = 'gh.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $zipfile = New-Object System.IO.Compression.ZipFile $zip, 'r'
+          $zipfile.ExtractAllToDirectory('.')
+          $zipfile.Close()
+          'gh-windows-x86_64/bin' >> $env:GITHUB_PATH
+
       - name: SHA256
         shell: powershell
         run: |
