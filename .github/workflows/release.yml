@@ -52,8 +52,8 @@ jobs:
           $url = 'https://github.com/cli/cli/releases/download/v2.103.2/gh_2.103.2_windows_amd64.zip'
           $zip = 'gh.zip'
           Invoke-WebRequest -Uri $url -OutFile $zip
-          7z x $zip -o ghcli
-          'ghcli/gh-2.103.2-windows-amd64/bin' >> $env:GITHUB_PATH
+          7z x $zip
+          'gh-2.103.2-windows-amd64/bin' >> $env:GITHUB_PATH
 
       - name: SHA256
         shell: powershell
