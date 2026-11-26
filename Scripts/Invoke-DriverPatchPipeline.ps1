@@ -80,6 +80,11 @@
   this toolkit at all. The report carries the install command for whatever is missing. Used by the
   GUI so the tool rules live in exactly one place.
 
+.PARAMETER Json
+  Only with -ShowOutputPath, -CheckLocalGpuSupport, -CheckPatchTools, -CheckSource or
+  -CheckNvAppStaged: print the answer as a single line of JSON (always with a "query" and, where
+  there is one, a "verdict" property) instead of the text report. The GUI uses this form.
+
 .PARAMETER KeepInf
   Extra INFs to protect from -PruneForeignOemInfs, by filename or bare stem.
 
@@ -185,6 +190,13 @@ param(
     # reason: the GUI asks rather than keeping a second copy of a pipeline rule.
     [switch]$CheckNvAppStaged,
 
+    # With one of the ask-and-stop switches above (-ShowOutputPath, -CheckLocalGpuSupport,
+    # -CheckPatchTools, -CheckSource, -CheckNvAppStaged): answer with ONE line of JSON on stdout
+    # instead of the human-readable report. This is what the GUI passes. The text form stays the
+    # default because a person at a console reads it; a program should not have to recognise
+    # indentation and verdict words in it.
+    [switch]$Json,
+
     # Patch a source that is not verifiably NVIDIA's: an .exe without a valid NVIDIA signature, or a
     # folder whose files NVIDIA's signed catalog does not cover (e.g. one already patched). The
     # output is re-signed with a certificate your machine trusts, so only pass this for a source
@@ -273,8 +285,20 @@ function Get-LocalGpuSupportReport {
     }
 }
 
+# One line of JSON for a query answer. -Compress keeps it on a single line, which is the whole
+# framing: the GUI takes the last stdout line that starts with "{". Arrays are passed as arrays in
+# the hashtable (never piped), so a one-element list stays a list.
+function Write-QueryJson {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Answer)
+    Write-Output (ConvertTo-Json -InputObject $Answer -Compress -Depth 4)
+}
+
 if ($CheckLocalGpuSupport) {
     $support = Get-LocalGpuSupportReport -Path $WhitelistPath
+    if ($Json) {
+        Write-QueryJson ([ordered]@{ query = 'localGpuSupport'; verdict = $support.Verdict; detail = @($support.Detail) })
+        return
+    }
     Write-Output $support.Verdict
     foreach ($l in $support.Detail) { Write-Output $l }
     return
@@ -298,6 +322,21 @@ if ($CheckPatchTools) {
         try { $seven = Find-SevenZip } catch { $seven = $null; $missingHard += '7z' }
     }
 
+    if ($Json) {
+        $help = @()
+        foreach ($m in $missingHard) { $help += @(Get-MissingToolHelp -ToolNames @($m)) }
+        Write-QueryJson ([ordered]@{
+            query          = 'patchTools'
+            verdict        = $(if ($missingHard.Count -gt 0) { 'TOOLS_MISSING' } else { 'TOOLS_OK' })
+            inf2cat        = [string]$inf2cat
+            signtool       = [string]$signtool
+            sevenZip       = [string]$seven
+            sevenZipNeeded = [bool]$needSeven
+            missing        = @($missingHard)
+            help           = @($help | ForEach-Object { [string]$_ })
+        })
+        return
+    }
     if ($missingHard.Count -gt 0) { Write-Output 'TOOLS_MISSING' } else { Write-Output 'TOOLS_OK' }
     Write-Output ("  Inf2Cat:  " + $(if ($inf2cat) { $inf2cat } else { 'NOT FOUND' }))
     Write-Output ("  signtool: " + $(if ($signtool) { $signtool } else { 'NOT FOUND' }))
@@ -312,6 +351,15 @@ if ($CheckNvAppStaged) {
     # Placement matters: this answers WITHOUT a source, like -CheckPatchTools above, and must
     # therefore return before the "pass exactly one of -SourceExePath/-SourcePackagePath" check.
     $pkg = Find-NvAppStagedPackage
+    if ($Json) {
+        if ($pkg) {
+            Write-QueryJson ([ordered]@{ query = 'nvAppStaged'; verdict = 'NVAPP_STAGED'; path = $pkg.Path
+                version = [string]$pkg.Version; staged = $pkg.Modified.ToString('yyyy-MM-dd HH:mm') })
+        } else {
+            Write-QueryJson ([ordered]@{ query = 'nvAppStaged'; verdict = 'NVAPP_NONE' })
+        }
+        return
+    }
     if ($pkg) {
         Write-Output 'NVAPP_STAGED'
         Write-Output ("  Path: " + $pkg.Path)
@@ -348,34 +396,34 @@ if ($PruneForeignOemInfs) { $outputSuffix = "_Patched_" + (Get-LocalGpuTag) }
 $usingExe = [bool]$SourceExePath
 if ($usingExe) {
     $SourceExePath = (Resolve-Path -LiteralPath $SourceExePath).Path
-    if (-not $OutputPath) {
-        $parent = Split-Path $SourceExePath -Parent
-        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($SourceExePath)
-        $OutputPath = Join-Path $parent ($leaf + $outputSuffix)
-    }
+    if (-not $OutputPath) { $OutputPath = Get-DefaultOutputPath -SourcePath $SourceExePath -IsExe -Suffix $outputSuffix }
 }
 else {
     $SourcePackagePath = (Resolve-Path -LiteralPath $SourcePackagePath).Path
     if (-not (Test-DriverPackageRoot $SourcePackagePath)) {
         throw "`"$SourcePackagePath`" doesn't look like an unpacked driver package root (expected setup.exe, setup.cfg, and a Display.Driver folder)."
     }
-    if (-not $OutputPath) {
-        $parent = Split-Path $SourcePackagePath -Parent
-        $leaf = Split-Path $SourcePackagePath -Leaf
-        $OutputPath = Join-Path $parent ($leaf + $outputSuffix)
-    }
+    # Beside the source - except for a package NVIDIA App staged, whose folder belongs to NVIDIA
+    # App: that one lands in the user's Downloads instead. The rule lives in Get-DefaultOutputPath.
+    if (-not $OutputPath) { $OutputPath = Get-DefaultOutputPath -SourcePath $SourcePackagePath -Suffix $outputSuffix }
 }
 
 # The GUI needs the same answer before it starts, for its overwrite check and to launch setup.exe
 # afterwards. Rather than reimplementing the naming rule in C# and letting the two drift, it asks
 # here and uses whatever comes back.
 if ($ShowOutputPath) {
-    Write-Output $OutputPath
+    if ($Json) { Write-QueryJson ([ordered]@{ query = 'outputPath'; outputPath = $OutputPath }) }
+    else { Write-Output $OutputPath }
     return
 }
 
 if ($CheckSource) {
     $src = Get-SourceReport
+    if ($Json) {
+        Write-QueryJson ([ordered]@{ query = 'source'; verdict = $(if ($src.Ok) { 'SOURCE_OK' } else { 'SOURCE_UNTRUSTED' })
+            problems = @($src.Problems); notes = @($src.Notes) })
+        return
+    }
     if ($src.Ok) { Write-Output 'SOURCE_OK' } else { Write-Output 'SOURCE_UNTRUSTED' }
     foreach ($p in $src.Problems) { Write-Output "  $p" }
     foreach ($n in $src.Notes) { Write-Output "  $n" }
@@ -385,6 +433,14 @@ if ($CheckSource) {
 if (Test-Path -LiteralPath $OutputPath) {
     throw "Output path already exists: $OutputPath`nRemove it or pass a different -OutputPath - this script never overwrites a previous run."
 }
+
+# Everything below is built in "<output>.partial" and renamed to the real name as the very last
+# step. Before this, a run that failed after the unpack - the verification gate, Inf2Cat, signtool -
+# left its half-done work under the FINAL name: a "<source>_Patched" folder with setup.exe, patched
+# INFs and NVIDIA's now-invalid catalog, indistinguishable from a finished package until someone
+# tried to install it. Now the final name exists only for a package that passed every step. A
+# rename within one folder is atomic, so there is no moment at which the final name is half-filled.
+$workPath = $OutputPath.TrimEnd('\') + '.partial'
 
 # --- Gate: a pruned build needs a GPU worth pruning for ----------------------------------------
 # Deliberately placed before the tool/certificate preflight and therefore before the multi-GB
@@ -521,6 +577,19 @@ Fix it once and every future run becomes passwordless:
 }
 Write-Host ""
 
+# Said BEFORE the long part, not after it: a build can take an hour, and on a machine with Secure
+# Boot on (or Test Signing off) the result will not load until that is changed. Not a stop - a
+# package is often built on one machine for another - and read from the registry, so it needs no
+# elevation and does not depend on the display language.
+try {
+    $bootAdvice = @(Get-BootSigningAdvice -State (Get-BootSigningState))
+    if ($bootAdvice.Count) {
+        foreach ($w in $bootAdvice) { Write-Warning $w }
+        Write-Host "  (This only matters on the PC the patched driver is installed on. The build continues.)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+} catch { }
+
 $totalSteps = 5   # copy/unpack, whitelist, RM override, certificate, sign
 if ($PruneForeignOemInfs)         { $totalSteps++ }
 if (-not $SkipOptionalComponents) { $totalSteps++ }
@@ -533,157 +602,179 @@ function Step-Banner {
     Write-Host "`n=== ${script:stepNum}/${totalSteps}: $Text ===" -ForegroundColor Magenta
 }
 
-if ($usingExe) {
-    Step-Banner "Unpacking installer"
-    & (Join-Path $PSScriptRoot "Unpack-DriverExe.ps1") -ExePath $SourceExePath -OutputPath $OutputPath -SevenZipPath $tools.SevenZip
+# A work folder left by an earlier failed run is, by its name, never a finished package: it is
+# removed here rather than turned into a second "already exists" refusal.
+if (Test-Path -LiteralPath $workPath) {
+    Write-Host "Removing the unfinished work folder of an earlier run: $workPath" -ForegroundColor DarkGray
+    Remove-Item -LiteralPath $workPath -Recurse -Force
 }
-else {
-    Step-Banner "Copying package"
-    Write-Host "  $SourcePackagePath"
-    Write-Host "  -> $OutputPath"
-    Copy-Item -LiteralPath $SourcePackagePath -Destination $OutputPath -Recurse
-}
-
-# Whitelist INFs the prune step removed on purpose. The later steps warn about a whitelist INF
-# they cannot find, because that normally means NVIDIA renamed or dropped it - but in a pruned
-# build an INF whose entries name no hardware in this PC is removed deliberately (e.g. nvami.inf,
-# all RTX A3000m, on an A2000m box). Passing the list along turns those into plain notes, so the
-# warning keeps its meaning for a real rename.
-$prunedWhitelistInfs = @()
-
-if ($PruneForeignOemInfs) {
-    # Runs FIRST, before any patching, so every later step has fewer INFs to walk: the whitelist
-    # patch, the RM override, the verification gate and above all the catalog rebuild. Measured on
-    # 616.86, pruning 43 INFs down to 2 took the rebuild from ~3000 s to 385 s.
-    $displayDriverDir = Join-Path $OutputPath "Display.Driver"
-    $whitelistInfNames = @((Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
-    $presentBeforePrune = @($whitelistInfNames | Where-Object {
-        @(Resolve-WhitelistInf -DisplayDriverPath $displayDriverDir -InfName $_).Count -gt 0 })
-
-    Step-Banner "Pruning OEM INFs that cannot match this machine"
-    & (Join-Path $PSScriptRoot "Remove-ForeignOemInfs.ps1") `
-        -PackageRoot $OutputPath `
-        -WhitelistPath $WhitelistPath `
-        -KeepInf $KeepInf
-
-    $prunedWhitelistInfs = @($presentBeforePrune | Where-Object {
-        @(Resolve-WhitelistInf -DisplayDriverPath $displayDriverDir -InfName $_).Count -eq 0 })
+$outputParent = Split-Path $OutputPath -Parent
+if ($outputParent -and -not (Test-Path -LiteralPath $outputParent)) {
+    New-Item -ItemType Directory -Path $outputParent -Force | Out-Null
 }
 
-Step-Banner "Patching device/subsystem whitelist"
-& (Join-Path $PSScriptRoot "Add-ExtraGpuSupport.ps1") `
-    -DisplayDriverPath (Join-Path $OutputPath "Display.Driver") `
-    -WhitelistPath $WhitelistPath `
-    -PrunedInf $prunedWhitelistInfs
-
-Step-Banner "Adding RM capability override (VRAM size / compute fix)"
-& (Join-Path $PSScriptRoot "Add-RmCapabilityOverride.ps1") `
-    -DisplayDriverPath (Join-Path $OutputPath "Display.Driver")
-
-if (-not $SkipOptionalComponents) {
-    # Make PhysX and the NVIDIA App behave for the unlocked GPUs the way they do for the ones
-    # NVIDIA supports out of the box. Both are gated on per-device INF feature flags that NVIDIA
-    # sets unevenly, and a missing flag makes the component vanish from the installer with no
-    # message. Runs before the gate so the catalog is built from fully-final INFs.
-    Step-Banner "Enabling PhysX / NVIDIA App for the unlocked GPUs"
-    & (Join-Path $PSScriptRoot "Enable-OptionalComponents.ps1") `
-        -PackageRoot $OutputPath `
-        -WhitelistPath $WhitelistPath `
-        -PrunedInf $prunedWhitelistInfs
-}
-
-if (-not $SkipPatchVerification) {
-    # The gate. Signing is the point of no return for a mistake: Inf2Cat will build a catalog
-    # from unpatched INFs and signtool will sign it, producing a package that looks finished and
-    # has no working unlock. This re-reads the INFs and refuses to go on unless the patches are
-    # actually there.
-    Step-Banner "Verifying the patch actually applied"
-    & (Join-Path $PSScriptRoot "Test-DriverPatch.ps1") `
-        -DisplayDriverPath (Join-Path $OutputPath "Display.Driver") `
-        -WhitelistPath $WhitelistPath `
-        -PrunedInf $prunedWhitelistInfs
-}
-
-Step-Banner "Signing certificate"
-if ($signingCert) {
-    Write-Host "  Reusing the certificate already in this machine's store - no password needed."
-    Write-Host "    Subject:    $($signingCert.Subject)"
-    Write-Host "    Thumbprint: $($signingCert.Thumbprint)"
-    Write-Host "    Expires:    $($signingCert.NotAfter)"
-    if ($importedFromPfx) { Write-Host "  (imported from $PfxPath during preflight)" -ForegroundColor DarkGray }
-    Write-Host "  (remove it from Cert:\CurrentUser\My, or pass -CertThumbprint, to use a different one)" -ForegroundColor DarkGray
-    # Found through the store search rather than a .cer file: put its public half back on disk so
-    # Approve-DriverPatchCert.ps1 and the next run find it the ordinary way.
-    $restoredCer = Save-SigningCerIfMissing -Certificate $signingCert -CertificatesDir $certificatesDir
-    if ($restoredCer) {
-        Write-Host "  Its public .cer was missing from $certificatesDir - re-exported it to:" -ForegroundColor Yellow
-        Write-Host "    $restoredCer" -ForegroundColor Yellow
-    }
-}
-elseif ($generateNewCert) {
-    Write-Host "  No certificate found - generating a new one in $certificatesDir"
-    if (-not (Test-Path -LiteralPath $certificatesDir)) {
-        New-Item -ItemType Directory -Path $certificatesDir -Force | Out-Null
-    }
-    # No password: the key is created non-exportable and stays in Cert:\CurrentUser\My, so there
-    # is no .pfx to protect. Signing then reads the key from the store, on this run and every
-    # later one.
-    $newThumb = & (Join-Path $PSScriptRoot "New-DriverSigningCert.ps1") -OutputDir $certificatesDir
-    $newThumb = ([string](@($newThumb) | Select-Object -Last 1)).Trim()
-    if (-not $newThumb) { throw "New-DriverSigningCert.ps1 did not return a thumbprint - cannot continue." }
-    $signingCert = Resolve-SigningCertificate -Thumbprint $newThumb
-    Write-Host ""
-    Write-Host "  NOTE: this new certificate is not trusted yet, so the driver will not load until" -ForegroundColor Yellow
-    Write-Host "  you run Approve-DriverPatchCert.ps1 (elevated) and enable Test Signing mode." -ForegroundColor Yellow
-}
-
-Step-Banner "Rebuilding + signing catalog"
-# Always from the store: a .pfx was imported during preflight, so no password travels any further.
-$signArgs = @{
-    DisplayDriverPath = (Join-Path $OutputPath "Display.Driver")
-    Inf2CatPath       = $tools.Inf2Cat
-    SignToolPath      = $tools.SignTool
-    SkipTimestamp     = $SkipTimestamp
-    NonInteractive    = $NonInteractive
-    CertThumbprint    = $signingCert.Thumbprint
-}
-& (Join-Path $PSScriptRoot "Sign-DriverPackage.ps1") @signArgs
-
-# Prune the pile of old driver-patch signing certificates from Cert:\CurrentUser\My, so repeated
-# runs don't leave a growing stack of self-signed signing keys. The certificate this run signed
-# with is protected; everything else matching the patch subject patterns is removed. Per-user My
-# store only, no elevation, no trust withdrawal, so it cannot break an already-patched package.
-# Trust-store cleanup stays opt-in via Remove-DriverPatchCert.ps1. Skip with -KeepAllOldCerts.
-#
-# Two deliberate limits. It runs only AFTER signing succeeded, so a failed run never costs a key.
-# And it is skipped on a run that had to mint a new certificate: the store search above found no
-# usable one, and deleting keys in the same run that replaced them leaves no way back if that was
-# a mistake. The next run, signing with the new certificate, prunes as usual.
-if ($signingCert -and -not $KeepAllOldCerts) {
-    if ($generateNewCert) {
-        Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it minted a new certificate." -ForegroundColor DarkGray
-    }
-    elseif ($importedFromPfx) {
-        # A key brought in from another PC's .pfx must never cost this PC its own non-exportable key.
-        Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it signed with an imported .pfx." -ForegroundColor DarkGray
+try {
+    if ($usingExe) {
+        Step-Banner "Unpacking installer"
+        & (Join-Path $PSScriptRoot "Unpack-DriverExe.ps1") -ExePath $SourceExePath -OutputPath $workPath -SevenZipPath $tools.SevenZip
     }
     else {
-        Remove-OldDriverPatchCerts -KeepThumbprint $signingCert.Thumbprint
+        Step-Banner "Copying package"
+        Write-Host "  $SourcePackagePath"
+        Write-Host "  -> $workPath"
+        Copy-Item -LiteralPath $SourcePackagePath -Destination $workPath -Recurse
     }
-}
 
-if (-not $SkipSetupCertOption) {
-    Step-Banner "Adding opt-in cert-trust option to installer"
-    # Add-SetupCertOption.ps1 needs the public .cer - exported fresh from the certificate that
-    # actually signed, rather than assuming a same-named .cer sits next to it. No password needed.
-    $tempCerPath = Join-Path ([System.IO.Path]::GetTempPath()) "GpuUnlockCert_$([guid]::NewGuid()).cer"
-    [System.IO.File]::WriteAllBytes($tempCerPath, $signingCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-    try {
-        & (Join-Path $PSScriptRoot "Add-SetupCertOption.ps1") -PackageRoot $OutputPath -CerPath $tempCerPath
+    # Whitelist INFs the prune step removed on purpose. The later steps warn about a whitelist INF
+    # they cannot find, because that normally means NVIDIA renamed or dropped it - but in a pruned
+    # build an INF whose entries name no hardware in this PC is removed deliberately (e.g. nvami.inf,
+    # all RTX A3000m, on an A2000m box). Passing the list along turns those into plain notes, so the
+    # warning keeps its meaning for a real rename.
+    $prunedWhitelistInfs = @()
+
+    if ($PruneForeignOemInfs) {
+        # Runs FIRST, before any patching, so every later step has fewer INFs to walk: the whitelist
+        # patch, the RM override, the verification gate and above all the catalog rebuild. Measured on
+        # 616.86, pruning 43 INFs down to 2 took the rebuild from ~3000 s to 385 s.
+        $displayDriverDir = Join-Path $workPath "Display.Driver"
+        $whitelistInfNames = @((Get-Content -LiteralPath $WhitelistPath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+        $presentBeforePrune = @($whitelistInfNames | Where-Object {
+            @(Resolve-WhitelistInf -DisplayDriverPath $displayDriverDir -InfName $_).Count -gt 0 })
+
+        Step-Banner "Pruning OEM INFs that cannot match this machine"
+        & (Join-Path $PSScriptRoot "Remove-ForeignOemInfs.ps1") `
+            -PackageRoot $workPath `
+            -WhitelistPath $WhitelistPath `
+            -KeepInf $KeepInf
+
+        $prunedWhitelistInfs = @($presentBeforePrune | Where-Object {
+            @(Resolve-WhitelistInf -DisplayDriverPath $displayDriverDir -InfName $_).Count -eq 0 })
     }
-    finally {
-        Remove-Item -LiteralPath $tempCerPath -ErrorAction SilentlyContinue
+
+    Step-Banner "Patching device/subsystem whitelist"
+    & (Join-Path $PSScriptRoot "Add-ExtraGpuSupport.ps1") `
+        -DisplayDriverPath (Join-Path $workPath "Display.Driver") `
+        -WhitelistPath $WhitelistPath `
+        -PrunedInf $prunedWhitelistInfs
+
+    Step-Banner "Adding RM capability override (VRAM size / compute fix)"
+    & (Join-Path $PSScriptRoot "Add-RmCapabilityOverride.ps1") `
+        -DisplayDriverPath (Join-Path $workPath "Display.Driver")
+
+    if (-not $SkipOptionalComponents) {
+        # Make PhysX and the NVIDIA App behave for the unlocked GPUs the way they do for the ones
+        # NVIDIA supports out of the box. Both are gated on per-device INF feature flags that NVIDIA
+        # sets unevenly, and a missing flag makes the component vanish from the installer with no
+        # message. Runs before the gate so the catalog is built from fully-final INFs.
+        Step-Banner "Enabling PhysX / NVIDIA App for the unlocked GPUs"
+        & (Join-Path $PSScriptRoot "Enable-OptionalComponents.ps1") `
+            -PackageRoot $workPath `
+            -WhitelistPath $WhitelistPath `
+            -PrunedInf $prunedWhitelistInfs
     }
+
+    if (-not $SkipPatchVerification) {
+        # The gate. Signing is the point of no return for a mistake: Inf2Cat will build a catalog
+        # from unpatched INFs and signtool will sign it, producing a package that looks finished and
+        # has no working unlock. This re-reads the INFs and refuses to go on unless the patches are
+        # actually there.
+        Step-Banner "Verifying the patch actually applied"
+        & (Join-Path $PSScriptRoot "Test-DriverPatch.ps1") `
+            -DisplayDriverPath (Join-Path $workPath "Display.Driver") `
+            -WhitelistPath $WhitelistPath `
+            -PrunedInf $prunedWhitelistInfs
+    }
+
+    Step-Banner "Signing certificate"
+    if ($signingCert) {
+        Write-Host "  Reusing the certificate already in this machine's store - no password needed."
+        Write-Host "    Subject:    $($signingCert.Subject)"
+        Write-Host "    Thumbprint: $($signingCert.Thumbprint)"
+        Write-Host "    Expires:    $($signingCert.NotAfter)"
+        if ($importedFromPfx) { Write-Host "  (imported from $PfxPath during preflight)" -ForegroundColor DarkGray }
+        Write-Host "  (remove it from Cert:\CurrentUser\My, or pass -CertThumbprint, to use a different one)" -ForegroundColor DarkGray
+        # Found through the store search rather than a .cer file: put its public half back on disk so
+        # Approve-DriverPatchCert.ps1 and the next run find it the ordinary way.
+        $restoredCer = Save-SigningCerIfMissing -Certificate $signingCert -CertificatesDir $certificatesDir
+        if ($restoredCer) {
+            Write-Host "  Its public .cer was missing from $certificatesDir - re-exported it to:" -ForegroundColor Yellow
+            Write-Host "    $restoredCer" -ForegroundColor Yellow
+        }
+    }
+    elseif ($generateNewCert) {
+        Write-Host "  No certificate found - generating a new one in $certificatesDir"
+        if (-not (Test-Path -LiteralPath $certificatesDir)) {
+            New-Item -ItemType Directory -Path $certificatesDir -Force | Out-Null
+        }
+        # No password: the key is created non-exportable and stays in Cert:\CurrentUser\My, so there
+        # is no .pfx to protect. Signing then reads the key from the store, on this run and every
+        # later one.
+        $newThumb = & (Join-Path $PSScriptRoot "New-DriverSigningCert.ps1") -OutputDir $certificatesDir
+        $newThumb = ([string](@($newThumb) | Select-Object -Last 1)).Trim()
+        if (-not $newThumb) { throw "New-DriverSigningCert.ps1 did not return a thumbprint - cannot continue." }
+        $signingCert = Resolve-SigningCertificate -Thumbprint $newThumb
+        Write-Host ""
+        Write-Host "  NOTE: this new certificate is not trusted yet, so the driver will not load until" -ForegroundColor Yellow
+        Write-Host "  you run Approve-DriverPatchCert.ps1 (elevated) and enable Test Signing mode." -ForegroundColor Yellow
+    }
+
+    Step-Banner "Rebuilding + signing catalog"
+    # Always from the store: a .pfx was imported during preflight, so no password travels any further.
+    $signArgs = @{
+        DisplayDriverPath = (Join-Path $workPath "Display.Driver")
+        Inf2CatPath       = $tools.Inf2Cat
+        SignToolPath      = $tools.SignTool
+        SkipTimestamp     = $SkipTimestamp
+        NonInteractive    = $NonInteractive
+        CertThumbprint    = $signingCert.Thumbprint
+    }
+    & (Join-Path $PSScriptRoot "Sign-DriverPackage.ps1") @signArgs
+
+    # Prune the pile of old driver-patch signing certificates from Cert:\CurrentUser\My, so repeated
+    # runs don't leave a growing stack of self-signed signing keys. The certificate this run signed
+    # with is protected; everything else matching the patch subject patterns is removed. Per-user My
+    # store only, no elevation, no trust withdrawal, so it cannot break an already-patched package.
+    # Trust-store cleanup stays opt-in via Remove-DriverPatchCert.ps1. Skip with -KeepAllOldCerts.
+    #
+    # Two deliberate limits. It runs only AFTER signing succeeded, so a failed run never costs a key.
+    # And it is skipped on a run that had to mint a new certificate: the store search above found no
+    # usable one, and deleting keys in the same run that replaced them leaves no way back if that was
+    # a mistake. The next run, signing with the new certificate, prunes as usual.
+    if ($signingCert -and -not $KeepAllOldCerts) {
+        if ($generateNewCert) {
+            Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it minted a new certificate." -ForegroundColor DarkGray
+        }
+        elseif ($importedFromPfx) {
+            # A key brought in from another PC's .pfx must never cost this PC its own non-exportable key.
+            Write-Host "  Old signing keys in Cert:\CurrentUser\My left in place on this run, because it signed with an imported .pfx." -ForegroundColor DarkGray
+        }
+        else {
+            Remove-OldDriverPatchCerts -KeepThumbprint $signingCert.Thumbprint
+        }
+    }
+
+    if (-not $SkipSetupCertOption) {
+        Step-Banner "Adding opt-in cert-trust option to installer"
+        # Add-SetupCertOption.ps1 needs the public .cer - exported fresh from the certificate that
+        # actually signed, rather than assuming a same-named .cer sits next to it. No password needed.
+        $tempCerPath = Join-Path ([System.IO.Path]::GetTempPath()) "GpuUnlockCert_$([guid]::NewGuid()).cer"
+        [System.IO.File]::WriteAllBytes($tempCerPath, $signingCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+        try {
+            & (Join-Path $PSScriptRoot "Add-SetupCertOption.ps1") -PackageRoot $workPath -CerPath $tempCerPath
+        }
+        finally {
+            Remove-Item -LiteralPath $tempCerPath -ErrorAction SilentlyContinue
+        }
+    }
+
+    # The last step, and the only one that creates the final name.
+    Move-Item -LiteralPath $workPath -Destination $OutputPath
+}
+catch {
+    if (Test-Path -LiteralPath $workPath) {
+        Write-Warning "The run did not finish. Its unfinished work is in $workPath - kept for inspection, NOT an installable package, and removed automatically by the next run. $OutputPath was not created."
+    }
+    throw
 }
 
 Write-Host "`n=== Done ===" -ForegroundColor Green

@@ -1,0 +1,61 @@
+name: CI
+
+# Runs the Pester suites and builds both GUI variants on every push and pull request.
+# Everything runs under Windows PowerShell 5.1 (shell: powershell), the toolkit's target.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scripts are ASCII-only
+        shell: powershell
+        run: |
+          # A BOM-less non-ASCII .ps1 is parsed as ANSI by Windows PowerShell 5.1 (see AGENTS.md).
+          $bad = @()
+          Get-ChildItem -LiteralPath Scripts, Tests, Source, Assets -Recurse -File -Include *.ps1 | ForEach-Object {
+              $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+              foreach ($b in $bytes) { if ($b -gt 127) { $bad += $_.FullName; break } }
+          }
+          if ($bad.Count) { throw "Non-ASCII bytes in: $($bad -join ', ')" }
+
+      - name: Pester 3.4 - 4.x is available
+        shell: powershell
+        run: |
+          $pester = Get-Module -ListAvailable Pester |
+              Where-Object { $_.Version -ge [version]'3.4' -and $_.Version -lt [version]'5.0' }
+          if (-not $pester) {
+              # Windows ships 3.4.0; this only runs on an image that dropped it.
+              Install-Module Pester -RequiredVersion 4.10.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Tests
+        shell: powershell
+        run: .\Tests\Run.ps1
+
+      - name: Build
+        shell: powershell
+        run: .\Source\Build.ps1 -Variant All
+
+      - name: SHA256
+        shell: powershell
+        run: |
+          Get-ChildItem -LiteralPath . -Filter 'Chameleon-Patcher-*.exe' -File | ForEach-Object {
+              '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $_.Name
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-patcher
+          path: Chameleon-Patcher-*.exe
+          if-no-files-found: error

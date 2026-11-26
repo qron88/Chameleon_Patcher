@@ -30,8 +30,9 @@ but is not (no unlock, wrong files). Most mechanisms below serve one of these.
 
 ## How to check a claim before you make it
 
-- `.\Tests\Run.ps1` - 90 Pester tests, ~5 s, Pester 3.4 (built into Windows PowerShell 5.1). They
-  build tiny packages, certificates and catalogs in `%TEMP%`; nothing touches a store. Run it with
+- `.\Tests\Run.ps1` - 122 Pester tests, ~20 s, Pester 3.4 (built into Windows PowerShell 5.1). They
+  build tiny packages, certificates and catalogs in `%TEMP%`; nothing touches a store. CI
+  (`.github\workflows\ci.yml`) runs the same script on every push and pull request. Run it with
   `powershell.exe -File .\Tests\Run.ps1`: from a PowerShell 7 host one test (`Get-SystemToolPath`
   "throws for a tool that is not in System32") fails for a host reason, not a code one.
 - A real run: `.\Scripts\Invoke-DriverPatchPipeline.ps1 -SourceExePath Drivers\<x>.exe
@@ -77,8 +78,13 @@ invisible to resolution and cleanup, leaving untracked trusted roots.
 ### Source verification and `-SkipSourceVerification`
 An `.exe` must carry a valid NVIDIA signature (it covers the appended 7z archive). A folder must have
 a WHQL/NVIDIA-signed catalog covering every INF and driver binary (wintrust membership, ~20 s for
-2.7 GB). The override exists because the author has hand-patched "Franken" packages; the GUI asks
-before using it. Microsoft signatures are accepted for catalogs (WHQL countersigns them) but never
+2.7 GB), and every PE file outside `Display.Driver` (`setup.exe`, `NVI2`, the other components) must
+carry its own valid NVIDIA/Microsoft signature - `Display.Driver` is what is re-signed, `setup.exe` is
+what is run. `setup.cfg` and the `.nvi` manifests are signed by nobody and are in no catalog, so a
+folder source cannot be verified completely; the report says so (`NOT verifiable`) rather than
+implying otherwise. **A real defect would be:** claiming a folder is fully verified, or an
+unsigned/foreign binary anywhere in a folder source passing. The override exists because the author
+has hand-patched "Franken" packages; the GUI asks before using it. Microsoft signatures are accepted for catalogs (WHQL countersigns them) but never
 for an `.exe` source.
 
 ### `RM1457588` in every `nv_miscBase_addreg__NN` section of every INF
@@ -138,12 +144,36 @@ pruned OEM INFs stay on disk with NVIDIA's (now invalid) signature; nothing decl
 
 ### The GUI asks the pipeline instead of reimplementing rules
 `-ShowOutputPath`, `-CheckLocalGpuSupport`, `-CheckPatchTools`, `-CheckSource`, `-CheckNvAppStaged`
-keep each rule in one place. The price is a text protocol: the first stdout line is a verdict word,
-and the GUI recognises
-the `.pfx` failure by the phrase `none was supplied and prompting is disabled`. Keep that phrase in
-`Invoke-DriverPatchPipeline.ps1` and `Sign-DriverPackage.ps1`. The pipeline forces UTF-8 stdout
-because a windowless child otherwise writes in the OEM codepage. A structured (JSON) protocol would
-be an improvement; until then, change both sides together.
+keep each rule in one place. The GUI passes `-Json` and reads ONE line of JSON (the last stdout line
+starting with `{`; `query`, `verdict` and the details as properties). Without `-Json` the same queries
+print the text report a person reads; that form is not a protocol any more and may be reworded. Add a
+property rather than renaming one - a standalone `.exe` in the field carries its own frozen scripts,
+but an overlay build runs whatever `Scripts\` is beside it. One text contract is left, and it is in
+the RUN's output, not in a query: the GUI recognises the `.pfx` failure by the phrase
+`none was supplied and prompting is disabled`. Keep that phrase in `Invoke-DriverPatchPipeline.ps1`
+and `Sign-DriverPackage.ps1`. The pipeline forces UTF-8 stdout because a windowless child otherwise
+writes in the OEM codepage.
+
+### The `.partial` work folder
+The pipeline builds in `<output>.partial` and renames it to `<output>` as its last act; a stale
+`.partial` is deleted at the start of the next run. That is what "a partial package must never be
+mistaken for a finished one" means in practice: before 1.2.1 a run that failed at the gate or in
+Inf2Cat left `<source>_Patched` itself behind. **A real defect would be:** any step writing to the
+final name before the rename, or the rename happening before the last step. **Do not propose**
+"resume from the partial folder": a half-patched INF set is not a state the patchers accept.
+
+### Where the output goes for an NVIDIA App source
+`Get-DefaultOutputPath`: beside the source, except for a package under NVIDIA App's staging folder,
+whose output goes to the user's Downloads. That folder is another product's, it is scanned by
+`Find-NvAppStagedPackage`, and ordinary users can write to it. The GUI's delete-before-overwrite
+check (`IsPlausibleOutputFolder`) accepts an output outside the source's parent only when it also
+looks like a driver package.
+
+### Tool lookup order
+Admin-installed 7-Zip/NanaZip under Program Files before the per-user WindowsApps alias and `PATH`
+(`Get-SevenZipCandidatePaths`): 7z decides what lands in the package after the `.exe` signature was
+checked. `certutil`/`bcdedit` come from System32 only. Test Signing and Secure Boot are read from the
+registry (`Get-BootSigningState`), never parsed out of `bcdedit`'s localized text.
 
 ### Other deliberate choices
 - Windows PowerShell 5.1 is the target; PowerShell 7 is not required. Scripts are ASCII-only (a
@@ -157,7 +187,12 @@ be an improvement; until then, change both sides together.
   carry the version. Default output is `Chameleon-Patcher-<version>.exe` (all of `Scripts\`
   embedded, unpacked to `%LOCALAPPDATA%\ChameleonPatcher` at start); `-Variant Overlay` builds
   `Chameleon-Patcher-Overlay-<version>.exe`, which runs the `Scripts\` beside it. After any change under
-  `Scripts\`, rebuild the standalone - it holds a frozen copy.
+  `Scripts\`, rebuild the standalone - it holds a frozen copy. At start the standalone rewrites
+  changed scripts atomically, deletes files under `Scripts\` it does not ship, and refuses to run
+  anything if the unpack failed.
+- The shared helpers are split by subject under `Scripts\Lib\`; `PatchToolDiscovery.ps1` is the one
+  entry point and loads them by an explicit list. The GUI is one partial class over
+  `Source\Chameleon-Patcher.cs` and `Source\MainForm.*.cs`.
 - Long comments explain past failures. Do not strip them as noise; move history to the changelog
   if a comment no longer explains current code.
 
@@ -178,14 +213,15 @@ block that is not the first child - are fixed in 1.0.7; see the changelog.)
 - **"The Test Signing warning in `Approve-DriverPatchCert.ps1` is a false alarm because `bcdedit /enum
   '{current}'` fails."** It fails when the shell is not elevated (plain `bcdedit /enum` answers
   access denied). The script is meant to run elevated, so a non-elevated measurement proves nothing.
-  What an elevated, non-English Windows prints for the value was not measured either way.
+  What an elevated, non-English Windows prints for the value was not measured either way - and no
+  longer matters: since 1.2.1 the state comes from the registry (`SystemStartOptions`), not bcdedit.
 - **"The gate prints `PASSED - 0/0` and exits 0."** Only with a hand-supplied empty `-WhitelistPath`
   (`'{}'`). The shipped `whitelist.json` has 61 entries, and a whitelist INF that resolves to no file
   is an error, not a skipped entry. Nobody gets 0/0 without asking for it.
 - **Findings that cite files or functions the repository does not have** (`Source\Helpers\*.ps1`,
   `Source\GUI\*.ps1`, `Import-EncodedFile`, `Set-InfProperty`, `Merge-InfSections`, ...). `Source\`
-  holds `Build.ps1` and `Chameleon-Patcher.cs` only; the GUI is C#, the helpers are in
-  `Scripts\PatchToolDiscovery.ps1`. Open the cited line before believing a finding; a claim that names
+  holds `Build.ps1`, `Chameleon-Patcher.cs` and `MainForm.*.cs` only; the GUI is C#, the helpers are in
+  `Scripts\Lib\*.ps1` (loaded through `Scripts\PatchToolDiscovery.ps1`). Open the cited line before believing a finding; a claim that names
   something missing from the tree is invented.
 
 Smaller claims of the same review that were already answered: the continuation counter *is* reported
@@ -198,8 +234,12 @@ files round-trip byte for byte).
 - Narrowing `RM1457588` to reachable sections - needs a hardware install test.
 - The installer's certificate row has no uninstall phase; trust outlives the driver.
 - One-physical-line matchers (see the gate) - waiting for a single shared INF model.
-- No CI; `Tests\Run.ps1` is run by hand.
-- GUI <-> pipeline text protocol.
+- The `.pfx` failure is still recognised by a phrase in the run's output (the queries are JSON).
+- No tests for the GUI, or for the scripts that need a real certificate store or the WDK.
+- The `TESTSIGNING` boot-option token was checked on a machine with Test Signing OFF only; the ON
+  case rests on Windows' documented behaviour, not on a measurement here.
+- CI and the release workflow were written for `windows-latest` and have not run yet.
+- The released `.exe` is not Authenticode-signed; the release carries a SHA256 instead.
 
 ## When you change something
 

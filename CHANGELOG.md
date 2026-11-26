@@ -5,10 +5,111 @@ All notable changes to Project Chameleon are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The version is declared in the assembly attributes at the top of `Source\Chameleon-Patcher.cs`
-and nowhere else; see [Version](README.md#version). Design notes and measurements that used to
+and nowhere else; see [Version](docs/development.md#version). Design notes and measurements that used to
 be in the README are under [Reference notes](#reference-notes) at the end of this file.
 
 ## [Unreleased]
+
+## [1.2.1] - 2026-11-26
+
+A review of 1.2.0 against the project's own threat model ("blessing something that is not
+NVIDIA's", "a package that looks finished but is not"). Each entry says what was wrong before.
+
+### Fixed
+- **A failed run left its half-done work under the final output name.** The pipeline unpacked
+  straight into `<source>_Patched` and nothing cleaned up when a later step failed, so a run stopped
+  by the verification gate, `Inf2Cat` or `signtool` left a `<source>_Patched` folder holding
+  `setup.exe`, patched INFs and NVIDIA's now-invalid catalog - the "partial package mistaken for a
+  finished one" that AGENTS.md says must not happen. Every step now works in `<output>.partial`,
+  which is renamed to `<output>` as the last act of a successful run. A failed run leaves the
+  `.partial` folder (kept for inspection, announced in a warning) and the next run removes it.
+- **Folder sources were only verified inside `Display.Driver`.** `Test-DriverSource` never looked at
+  `setup.exe`, `NVI2` or the other components, while the GUI described the copy as "verified as
+  NVIDIA's" and offered to launch its `setup.exe`. Since 1.2.0 made the folder NVIDIA App stages the
+  offered default source - a folder ordinary users can write to (`BUILTIN\Users: Write` on the
+  staging directory, read from its ACL) - that gap sat on the main path. Every PE file outside
+  `Display.Driver` must now carry a valid NVIDIA/Microsoft signature. Measured on a staged 621.40
+  package: 14 such files (13 NVIDIA, 1 Microsoft), all valid, about one second.
+- **What a folder cannot prove is now said instead of implied.** `setup.cfg` and the `.nvi` manifests
+  are signed by nobody and are in no catalog, yet they direct what `setup.exe` runs (the project's
+  own `GpuUnlockCert.nvi` runs `certutil` that way). The source report carries a `NOT verifiable`
+  note for them, the GUI text no longer says "verified as NVIDIA's", and the docs explain the limit.
+- **The Test Signing warning depended on the display language.** `Approve-DriverPatchCert.ps1`
+  matched `testsigning  Yes` in `bcdedit`'s output, which is localized and needs elevation. The state
+  now comes from the registry (`SystemStartOptions` for Test Signing,
+  `SecureBoot\State\UEFISecureBootEnabled` for Secure Boot) through `Get-BootSigningState`. Read on a
+  pl-PL Windows 11 without elevation; the `TESTSIGNING` token itself was only observed absent (Test
+  Signing is off on that machine), so the ON case rests on Windows' documented behaviour.
+- **A build could run for an hour before anyone learned the result cannot load.** The pipeline's
+  preflight now prints the same boot-state warnings (Secure Boot on, Test Signing off) before the
+  unpack. A warning, not a stop: a package is often built on one machine for another.
+- **Output for an NVIDIA App source landed in NVIDIA App's own folder.** The default was
+  `<source>_Patched` beside the source, i.e. `...\ota-artifacts\grd\post-processing\<hash>_Patched`.
+  For that source the default is now `Downloads\NVIDIA-<version>-<hash8>_Patched`
+  (`Get-DefaultOutputPath`); every other source is unchanged. The GUI's delete-before-overwrite
+  check accepts an output outside the source's parent only when it also looks like a driver package.
+- **The 7z CLI was taken from a user-writable place first.** `Find-SevenZip` tried
+  `%LOCALAPPDATA%\Microsoft\WindowsApps\7z.exe` before `Program Files`. 7z decides which bytes land
+  in the package after the download's signature was checked, so admin-installed copies now come
+  first (`Get-SevenZipCandidatePaths`); the alias and `PATH` remain as fallbacks.
+- **Standalone script unpacking.** A failed unpack only showed a message and the GUI then ran
+  whatever older scripts were in `%LOCALAPPDATA%\ChameleonPatcher\Scripts`; Start is now refused for
+  that session. Scripts a newer build no longer ships were never removed; they are now. The write
+  described as atomic was delete-then-move; it is `File.Replace` for an existing file.
+- **The startup offer's text wrapped badly.** The message box broke the opening sentence two words
+  before its end and cut the folder in the middle of `NVIDIA App`. Version and date now have a line
+  each and the folder is broken only after a backslash; "as usual" is gone from the last line.
+
+### Changed
+- **The GUI reads JSON from the pipeline.** `-ShowOutputPath`, `-CheckLocalGpuSupport`,
+  `-CheckPatchTools`, `-CheckSource` and `-CheckNvAppStaged` take `-Json` and answer with one line
+  (`query`, `verdict`, details as properties). The GUI no longer recognises verdict words, line
+  prefixes and four-space indentation; this closes the "GUI <-> pipeline text protocol" open item
+  for the queries. Without `-Json` the text reports are unchanged. Still text: the `.pfx` failure
+  phrase in the run's own output. `Build.ps1` references `System.Web.Extensions.dll`
+  (`JavaScriptSerializer`, part of the .NET Framework).
+- **`PatchToolDiscovery.ps1` is split by subject.** Its 1,800 lines moved, unchanged, to
+  `Scripts\Lib\` (`Tools`, `Package`, `Inf`, `Hardware`, `Certificates`, `Source`).
+  `PatchToolDiscovery.ps1` stays the one entry point and loads them by an explicit list, so every
+  script and test dot-sources it exactly as before.
+- **The GUI source is split too.** `MainForm` is one partial class over `Chameleon-Patcher.cs` and
+  `MainForm.Ui.cs` / `.Dialogs.cs` / `.Pipeline.cs` / `.Log.cs` / `.Run.cs`; `Build.ps1` compiles
+  every `.cs` in `Source\`. Methods were moved, not edited.
+- **README rewritten around getting a driver installed.** It went from 1,072 lines to about 270:
+  what the tool does, a numbered quick start, requirements, using the app, the command line,
+  installing, and a per-generation summary of supported GPUs. It now shows two screenshots
+  (`docs\images\main-window.png` and `nvapp-offer.png`, taken from the 1.2.1 overlay build) and
+  points at Releases for the `.exe` instead of only "build it". The reference material moved - text
+  unchanged except for links and the `.partial` wording - to `docs\supported-gpus.md`,
+  `docs\gui.md`, `docs\pipeline.md`, `docs\signing-and-trust.md` and `docs\development.md`.
+
+### Added
+- **CI.** `.github\workflows\ci.yml` runs on every push and pull request (`windows-latest`, Windows
+  PowerShell 5.1): ASCII check on every `.ps1`, `Tests\Run.ps1`, both builds, SHA256.
+  `.github\workflows\release.yml` runs on a `v<version>` tag: it refuses a tag that does not match
+  the source version, tests, builds the standalone `.exe` from the tagged commit and attaches it to
+  the release with a `.sha256` file. **Neither workflow has run yet** - they were written against
+  the runner's documented contents, not observed on it.
+- `Tests\PipelineSafety.Tests.ps1`, 27 tests: 7z lookup order, the boot-state reader and its
+  wording, `Get-DefaultOutputPath`, whole-package source verification (unsigned `setup.exe` and a
+  planted `NVI2` DLL refused, a validly signed binary accepted, the manifest note), the `-Json`
+  answers (including a path with `[1]` in it), the `.partial` behaviour on a run that fails before
+  signing, and `Remove-ForeignOemInfs.ps1` - until now the one script that deletes files and had no
+  test (prunes by hardware, keeps a foreign-SUBSYS match out, honours `-KeepInf` and `-WhatIf`,
+  leaves companions and no staging folder, refuses to prune to zero INFs).
+
+### Verified
+- `Tests\Run.ps1`: 122 passed (95 before), about 20 s - the new suite starts the pipeline as a child
+  process several times.
+- Both variants build clean; the overlay build was started on a machine with a staged 621.40
+  package and showed the startup offer, i.e. the `-CheckNvAppStaged -Json` round trip works in the
+  GUI. The dialog text was checked from a screenshot.
+- The `-Json` queries were run against the real staged package (`-ShowOutputPath` answered
+  `Downloads\NVIDIA-621.40-8f0c84c5_Patched`).
+- **Not done:** a real patch run end to end (no driver was installed, no trust store touched), so
+  the `.partial` rename is covered by the failing-run test and by reading, not by a full successful
+  run; the GUI's other dialogs (missing tools, untrusted source, pruned build) compile against the
+  JSON fields but were not exercised by hand.
 
 ## [1.2.0] - 2026-11-25
 
