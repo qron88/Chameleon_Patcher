@@ -76,9 +76,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # A native command's stderr is a terminating error under the Actions shell
+          # (ErrorActionPreference=Stop), so "release not found" would abort the step.
+          $ErrorActionPreference = 'Continue'
           $tag = $env:GITHUB_REF_NAME
           $exe = "Chameleon-Patcher-$($env:VERSION).exe"
-          gh release view $tag *> $null
+          gh release view $tag 2> $null | Out-Null
           if ($LASTEXITCODE -ne 0) {
               gh release create $tag --title $tag --notes "See CHANGELOG.md for what changed in $tag." --verify-tag
               if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
@@ -86,3 +89,4 @@ jobs:
           # --clobber: the file built here, from the tagged commit, is the one the hash describes.
           gh release upload $tag $exe "$exe.sha256" --clobber
           if ($LASTEXITCODE -ne 0) { throw 'gh release upload failed.' }
+          gh release view $tag
