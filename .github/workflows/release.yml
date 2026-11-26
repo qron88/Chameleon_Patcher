@@ -49,11 +49,18 @@ jobs:
       - name: Install GitHub CLI
         shell: powershell
         run: |
+          # The archive carries a root-level LICENSE that collides with the repo's own;
+          # -o must be one token ("-oghcli") or 7-Zip reports "Too short switch".
           $url = 'https://github.com/cli/cli/releases/download/v2.103.2/gh_2.103.2_windows_amd64.zip'
           $zip = 'gh.zip'
           Invoke-WebRequest -Uri $url -OutFile $zip
-          7z x $zip
-          'gh-2.103.2-windows-amd64/bin' >> $env:GITHUB_PATH
+          7z x $zip "-oghcli" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'gh extraction failed.' }
+          $bin = (Get-ChildItem -LiteralPath ghcli -Recurse -Directory -Filter bin |
+              Select-Object -First 1).FullName
+          if (-not $bin) { throw 'gh bin directory not found in the archive.' }
+          $bin >> $env:GITHUB_PATH
+          & "$bin\gh.exe" --version
 
       - name: SHA256
         shell: powershell
