@@ -23,7 +23,7 @@ jobs:
         run: |
           # A BOM-less non-ASCII .ps1 is parsed as ANSI by Windows PowerShell 5.1 (see AGENTS.md).
           $bad = @()
-          Get-ChildItem -LiteralPath Scripts, Tests, Source, Assets -Recurse -File -Include *.ps1 | ForEach-Object {
+          Get-ChildItem -LiteralPath Scripts, Tests, Source, Assets -Recurse -File -Include '*.ps1' | ForEach-Object {
               $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
               foreach ($b in $bytes) { if ($b -gt 127) { $bad += $_.FullName; break } }
           }
